@@ -1319,8 +1319,13 @@ def run_review_server(
             try:
                 img = open_canonical_image(p)
                 try:
-                    if img.mode not in ("RGB", "RGBA"):
-                        img = img.convert("RGB")
+                    if img.mode != "RGB":
+                        if img.mode in ("RGBA", "LA", "PA"):
+                            bg = Image.new("RGB", img.size, (255, 255, 255))
+                            bg.paste(img, mask=img.split()[-1])
+                            img = bg
+                        else:
+                            img = img.convert("RGB")
                     buf = io.BytesIO()
                     img.save(buf, format="JPEG", quality=92)
                     return Response(buf.getvalue(), mimetype="image/jpeg",
@@ -1329,7 +1334,8 @@ def run_review_server(
                     if hasattr(img, "close"):
                         img.close()
             except Exception as e:
-                print(f"  image render error on {p}: {e}", file=sys.stderr)
+                print(f"  image render error on {p}: {type(e).__name__}: {e}",
+                      file=sys.stderr)
                 abort(500)
         ext_key = ext.lstrip(".")
         mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
@@ -1354,8 +1360,14 @@ def run_review_server(
             img = open_canonical_image(p)
             try:
                 img.thumbnail((w, w * 4), Image.Resampling.LANCZOS)
-                if img.mode not in ("RGB", "RGBA"):
-                    img = img.convert("RGB")
+                # JPEG doesn't support alpha; flatten RGBA onto white.
+                if img.mode != "RGB":
+                    if img.mode in ("RGBA", "LA", "PA"):
+                        bg = Image.new("RGB", img.size, (255, 255, 255))
+                        bg.paste(img, mask=img.split()[-1])
+                        img = bg
+                    else:
+                        img = img.convert("RGB")
                 buf = io.BytesIO()
                 img.save(buf, format="JPEG", quality=82)
                 return Response(buf.getvalue(), mimetype="image/jpeg",
@@ -1364,7 +1376,7 @@ def run_review_server(
                 if hasattr(img, "close"):
                     img.close()
         except Exception as e:
-            print(f"  thumb error on {p}: {e}", file=sys.stderr)
+            print(f"  thumb error on {p}: {type(e).__name__}: {e}", file=sys.stderr)
             abort(500)
 
     @app.route("/api/commit", methods=["POST"])
