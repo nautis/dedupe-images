@@ -53,37 +53,49 @@ cp "$ROOT/dedupe_images.py" "$APP/Contents/Resources/dedupe_images.py"
 cp "$SWIFT_BIN" "$APP/Contents/Resources/dedupe-images-swift"
 
 # Launcher: prompts for a folder, runs --review against it.
+# The server runs detached - no Terminal window. It opens the browser itself
+# via webbrowser.open(). Stdout/stderr go to ~/Library/Logs/DedupeImages/.
 cat > "$APP/Contents/MacOS/launcher" <<'LAUNCHER'
 #!/usr/bin/env bash
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 RES="$HERE/../Resources"
 
-# Folder picker via osascript.
-FOLDER=$(osascript -e 'POSIX path of (choose folder with prompt "Pick a folder to dedupe:")' 2>/dev/null) || exit 0
-if [[ -z "$FOLDER" ]]; then exit 0; fi
-
-# Strip trailing slash.
-FOLDER="${FOLDER%/}"
-
-QUAR="$HOME/dedupe-quarantine"
-
-# uv is the cleanest path; if not installed, fall back to a clear error.
+# uv is required; if missing, alert and exit.
 UV="$(command -v uv || true)"
 if [[ -z "$UV" ]]; then
-    osascript -e 'display alert "uv is required" message "Install uv (brew install uv) and try again. The DedupeImages app uses uv to auto-install Python deps."' >/dev/null
+    # Common Homebrew install paths in case PATH isn't propagated to .app launchers.
+    for p in /opt/homebrew/bin/uv /usr/local/bin/uv "$HOME/.local/bin/uv"; do
+        if [[ -x "$p" ]]; then UV="$p"; break; fi
+    done
+fi
+if [[ -z "$UV" ]]; then
+    osascript -e 'display alert "uv is required" message "Install uv (brew install uv) and try again."' >/dev/null
     exit 1
 fi
 
-# Open Terminal so the user can see progress + interact, since --review
-# blocks until commit. Using AppleScript to launch in a new Terminal window.
-SCRIPT="exec '$UV' run '$RES/dedupe_images.py' --review --quarantine '$QUAR' --flat '$FOLDER'"
-osascript <<APPLESCRIPT
-tell application "Terminal"
-    activate
-    do script "$SCRIPT"
-end tell
-APPLESCRIPT
+# Folder picker.
+FOLDER=$(osascript -e 'POSIX path of (choose folder with prompt "Pick a folder to dedupe:")' 2>/dev/null) || exit 0
+if [[ -z "$FOLDER" ]]; then exit 0; fi
+FOLDER="${FOLDER%/}"
+
+QUAR="$HOME/dedupe-quarantine"
+LOG_DIR="$HOME/Library/Logs/DedupeImages"
+mkdir -p "$LOG_DIR"
+LOG="$LOG_DIR/run-$(date +%Y%m%d-%H%M%S).log"
+
+# Run the server fully detached. nohup + & + disown means the server stays
+# alive after this launcher exits. Stdout/stderr go to the log file.
+# The server itself calls webbrowser.open() once ready, so no Terminal needed.
+nohup "$UV" run "$RES/dedupe_images.py" \
+    --review --quarantine "$QUAR" --flat "$FOLDER" \
+    > "$LOG" 2>&1 < /dev/null &
+disown
+
+# Friendly hint via system notification (non-blocking).
+osascript -e "display notification \"Scanning $FOLDER. Browser will open when ready.\" with title \"DedupeImages\" subtitle \"Logs: $LOG\"" 2>/dev/null || true
+
+exit 0
 LAUNCHER
 
 chmod +x "$APP/Contents/MacOS/launcher"
