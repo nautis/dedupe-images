@@ -14,15 +14,18 @@ ROOT="$(pwd)"
 DIST="$ROOT/macapp/dist"
 APP="$DIST/DedupeImages.app"
 
-# Build the Swift binary (release) so it ends up tight in the bundle.
-echo "==> Building Swift CLI (release)..."
+# Build the Swift binaries (release): CLI for headless use, App for the .app.
+echo "==> Building Swift CLI + SwiftUI App (release)..."
 ( cd "$ROOT/swift" && swift build -c release ) > /dev/null
 
-SWIFT_BIN="$ROOT/swift/.build/release/DedupeImagesCLI"
-if [[ ! -x "$SWIFT_BIN" ]]; then
-    echo "Swift binary not found at $SWIFT_BIN" >&2
-    exit 1
-fi
+SWIFT_CLI="$ROOT/swift/.build/release/DedupeImagesCLI"
+SWIFT_APP="$ROOT/swift/.build/release/DedupeImagesApp"
+for bin in "$SWIFT_CLI" "$SWIFT_APP"; do
+    if [[ ! -x "$bin" ]]; then
+        echo "Swift binary not found: $bin" >&2
+        exit 1
+    fi
+done
 
 echo "==> Generating app icon..."
 ICON_PNG="$ROOT/macapp/icon.png"
@@ -60,13 +63,13 @@ mkdir -p "$APP/Contents/MacOS"
 mkdir -p "$APP/Contents/Resources"
 [[ -f "$ICNS" ]] && cp "$ICNS" "$APP/Contents/Resources/AppIcon.icns"
 
-# Info.plist — minimum needed for a clickable Cocoa app.
+# Info.plist — for the native SwiftUI app.
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleExecutable</key><string>launcher</string>
+    <key>CFBundleExecutable</key><string>DedupeImages</string>
     <key>CFBundleIdentifier</key><string>com.nautis.dedupeimages</string>
     <key>CFBundleName</key><string>DedupeImages</string>
     <key>CFBundleDisplayName</key><string>Dedupe Images</string>
@@ -81,58 +84,15 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-# Bundle the Python script and the Swift CLI as resources.
+# Native SwiftUI binary as the executable.
+cp "$SWIFT_APP" "$APP/Contents/MacOS/DedupeImages"
+chmod +x "$APP/Contents/MacOS/DedupeImages"
+
+# Bundle the headless CLI binary + the Python tool as resources for advanced uses.
 cp "$ROOT/dedupe_images.py" "$APP/Contents/Resources/dedupe_images.py"
-cp "$SWIFT_BIN" "$APP/Contents/Resources/dedupe-images-swift"
-
-# Launcher: prompts for a folder, runs --review against it.
-# The server runs detached - no Terminal window. It opens the browser itself
-# via webbrowser.open(). Stdout/stderr go to ~/Library/Logs/DedupeImages/.
-cat > "$APP/Contents/MacOS/launcher" <<'LAUNCHER'
-#!/usr/bin/env bash
-set -e
-HERE="$(cd "$(dirname "$0")" && pwd)"
-RES="$HERE/../Resources"
-
-# uv is required; if missing, alert and exit.
-UV="$(command -v uv || true)"
-if [[ -z "$UV" ]]; then
-    # Common Homebrew install paths in case PATH isn't propagated to .app launchers.
-    for p in /opt/homebrew/bin/uv /usr/local/bin/uv "$HOME/.local/bin/uv"; do
-        if [[ -x "$p" ]]; then UV="$p"; break; fi
-    done
-fi
-if [[ -z "$UV" ]]; then
-    osascript -e 'display alert "uv is required" message "Install uv (brew install uv) and try again."' >/dev/null
-    exit 1
-fi
-
-# Folder picker.
-FOLDER=$(osascript -e 'POSIX path of (choose folder with prompt "Pick a folder to dedupe:")' 2>/dev/null) || exit 0
-if [[ -z "$FOLDER" ]]; then exit 0; fi
-FOLDER="${FOLDER%/}"
-
-QUAR="$HOME/dedupe-quarantine"
-LOG_DIR="$HOME/Library/Logs/DedupeImages"
-mkdir -p "$LOG_DIR"
-LOG="$LOG_DIR/run-$(date +%Y%m%d-%H%M%S).log"
-
-# Run the server fully detached. nohup + & + disown means the server stays
-# alive after this launcher exits. Stdout/stderr go to the log file.
-# The server itself calls webbrowser.open() once ready, so no Terminal needed.
-nohup "$UV" run "$RES/dedupe_images.py" \
-    --review --quarantine "$QUAR" --flat "$FOLDER" \
-    > "$LOG" 2>&1 < /dev/null &
-disown
-
-# Friendly hint via system notification (non-blocking).
-osascript -e "display notification \"Scanning $FOLDER. Browser will open when ready.\" with title \"DedupeImages\" subtitle \"Logs: $LOG\"" 2>/dev/null || true
-
-exit 0
-LAUNCHER
-
-chmod +x "$APP/Contents/MacOS/launcher"
+cp "$SWIFT_CLI" "$APP/Contents/Resources/dedupe-images-swift"
 chmod +x "$APP/Contents/Resources/dedupe-images-swift"
+
 
 INSTALL=0
 for arg in "$@"; do
