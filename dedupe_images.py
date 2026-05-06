@@ -5,10 +5,11 @@
 #     "Pillow>=10.0",
 #     "imagehash>=4.3",
 #     "pillow-heif>=0.16",
+#     "Flask>=3.0",
 # ]
 # ///
 """
-dedupe-images: three-tier image deduplication.
+dedupe-images: three-tier image deduplication with optional web review UI.
 
 Tier 1 - byte-identical: SHA-256 of the file.
 Tier 2 - same pixels, metadata differs: SHA-256 of the decoded pixel buffer.
@@ -22,18 +23,23 @@ weakest tier that joined any pair of files inside it - so a cluster where some
 files are byte-identical and others only pixel-identical is labeled Tier 2.
 
 Default action is report-only. --quarantine moves all-but-one of each duplicate
-group into a holding directory; nothing is ever deleted.
+group into a holding directory; nothing is ever deleted. --review opens a local
+web UI where you eyeball each cluster and decide what to keep.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import shutil
 import sys
 import time
+import threading
+import urllib.parse
+import webbrowser
 from collections import defaultdict
 from pathlib import Path
 
@@ -102,12 +108,12 @@ def hamming(a: int, b: int) -> int:
     return (a ^ b).bit_count()
 
 
-# ---------- union-find over file indexes ----------
+# ---------- union-find ----------
 
 class UF:
     def __init__(self, n: int) -> None:
         self.parent = list(range(n))
-        self.tier = [0] * n  # weakest tier of any union touching this root
+        self.tier = [0] * n
 
     def find(self, x: int) -> int:
         while self.parent[x] != x:
@@ -120,12 +126,11 @@ class UF:
         if ra == rb:
             self.tier[ra] = max(self.tier[ra], tier)
             return
-        # attach smaller-index root to larger; simple, stable
         self.parent[ra] = rb
         self.tier[rb] = max(self.tier[ra], self.tier[rb], tier)
 
 
-# ---------- file walking and helpers ----------
+# ---------- helpers ----------
 
 def walk_images(roots: list[Path], allow_photos: bool):
     for root in roots:
@@ -174,11 +179,532 @@ def keep_index(group: list[tuple[Path, int]], strategy: str) -> int:
     return 0
 
 
+# ---------- core: compute clusters ----------
+
+def compute_clusters(
+    roots: list[Path],
+    *,
+    threshold: int = 8,
+    allow_photos: bool = False,
+    min_size: int = 1024,
+    skip_tier3: bool = False,
+    log_progress: bool = True,
+) -> dict[int, list[list[tuple[Path, int]]]]:
+    """Scan roots, run 3-tier dedup, return {tier: [cluster, ...]} where
+    each cluster is a list of (path, size) tuples and tier is the weakest
+    joining tier."""
+
+    if log_progress:
+        print(f"Scanning {len(roots)} root(s)...", file=sys.stderr)
+    files: list[tuple[Path, int]] = []
+    for f in walk_images(roots, allow_photos):
+        try:
+            sz = f.stat().st_size
+        except OSError:
+            continue
+        if sz < min_size:
+            continue
+        files.append((f, sz))
+    if log_progress:
+        print(f"Found {len(files)} candidate images", file=sys.stderr)
+    if not files:
+        return {1: [], 2: [], 3: []}
+
+    n = len(files)
+    uf = UF(n)
+
+    # Tier 1
+    by_sha: dict[str, list[int]] = defaultdict(list)
+    for i, (f, _) in enumerate(files):
+        try:
+            by_sha[sha256_file(f)].append(i)
+        except OSError as e:
+            if log_progress:
+                print(f"\n  read error on {f}: {e}", file=sys.stderr)
+        if log_progress and ((i + 1) % 25 == 0 or i == n - 1):
+            progress("Tier 1 (file SHA)    ", i + 1, n)
+    for indices in by_sha.values():
+        for j in indices[1:]:
+            uf.union(indices[0], j, tier=1)
+
+    # Tier 2
+    tier1_reps = [grp[0] for grp in by_sha.values()]
+    by_pixels: dict[str, list[int]] = defaultdict(list)
+    for k, idx in enumerate(tier1_reps, 1):
+        f, _ = files[idx]
+        ph = pixel_sha256(f)
+        if ph is not None:
+            by_pixels[ph].append(idx)
+        if log_progress and (k % 25 == 0 or k == len(tier1_reps)):
+            progress("Tier 2 (pixel SHA)   ", k, len(tier1_reps))
+    for indices in by_pixels.values():
+        for j in indices[1:]:
+            uf.union(indices[0], j, tier=2)
+
+    # Tier 3
+    if not skip_tier3:
+        rep_for_cluster: dict[int, int] = {}
+        for i in range(n):
+            r = uf.find(i)
+            if r not in rep_for_cluster:
+                rep_for_cluster[r] = i
+        cluster_reps = list(rep_for_cluster.values())
+
+        candidates: list[tuple[int, int, int]] = []
+        for k, idx in enumerate(cluster_reps, 1):
+            f, _ = files[idx]
+            d, p = perceptual_hashes(f)
+            if d is not None:
+                candidates.append((idx, d, p))
+            if log_progress and (k % 25 == 0 or k == len(cluster_reps)):
+                progress("Tier 3 (perceptual)  ", k, len(cluster_reps))
+
+        buckets: dict[int, list[int]] = defaultdict(list)
+        for ci, (_, d, _) in enumerate(candidates):
+            buckets[d >> 60].append(ci)
+
+        for ci, (idx_a, d1, p1) in enumerate(candidates):
+            top = d1 >> 60
+            adjacent = {b for b in (top - 1, top, top + 1) if 0 <= b <= 0xF}
+            for b in adjacent:
+                for cj in buckets.get(b, []):
+                    if cj <= ci:
+                        continue
+                    idx_b, d2, p2 = candidates[cj]
+                    if hamming(d1, d2) <= threshold and hamming(p1, p2) <= threshold:
+                        uf.union(idx_a, idx_b, tier=3)
+
+    # Build clusters
+    clusters_by_root: dict[int, list[int]] = defaultdict(list)
+    for i in range(n):
+        clusters_by_root[uf.find(i)].append(i)
+
+    by_tier: dict[int, list[list[tuple[Path, int]]]] = {1: [], 2: [], 3: []}
+    for root, idxs in clusters_by_root.items():
+        if len(idxs) < 2:
+            continue
+        members = [files[i] for i in idxs]
+        members.sort(key=lambda fs: str(fs[0]))
+        tier = uf.tier[root] or 1
+        by_tier[tier].append(members)
+
+    # Sort clusters within each tier by total size, descending
+    for t in by_tier:
+        by_tier[t].sort(key=lambda g: -sum(sz for _, sz in g))
+
+    return by_tier
+
+
+# ---------- review server ----------
+
+REVIEW_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>dedupe-images review</title>
+<style>
+  :root {
+    --bg: #1a1a1a; --fg: #eee; --muted: #888;
+    --keep: #2d8a3e; --dupe: #a83232; --skip: #555;
+    --accent: #4a9eff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+         background: var(--bg); color: var(--fg); }
+  header { padding: 12px 24px; background: #222; display: flex;
+           justify-content: space-between; align-items: center;
+           border-bottom: 1px solid #333; position: sticky; top: 0; z-index: 10; }
+  header h1 { margin: 0; font-size: 16px; font-weight: 500; }
+  header .meta { font-size: 13px; color: var(--muted); }
+  header button { background: var(--accent); color: white; border: 0;
+                  padding: 8px 16px; border-radius: 6px; cursor: pointer;
+                  font-size: 14px; }
+  header button:disabled { background: var(--skip); cursor: not-allowed; }
+  header button:hover:not(:disabled) { opacity: 0.9; }
+  .nav { display: flex; gap: 8px; align-items: center; }
+  .nav button { background: #333; color: var(--fg); padding: 6px 12px; }
+  .cluster-info { padding: 16px 24px; font-size: 14px; color: var(--muted); }
+  .cluster-info b { color: var(--fg); }
+  .grid { display: grid; gap: 16px; padding: 0 24px 24px;
+          grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); }
+  .card { background: #222; border-radius: 8px; overflow: hidden;
+          border: 3px solid transparent; transition: border-color 0.15s; }
+  .card.keep { border-color: var(--keep); }
+  .card.dupe { border-color: var(--dupe); }
+  .card img { width: 100%; height: 360px; object-fit: contain;
+              background: #111; cursor: zoom-in; display: block; }
+  .card .info { padding: 10px 12px; font-size: 12px; }
+  .card .info .num { font-weight: bold; color: var(--accent); margin-right: 6px; }
+  .card .info .path { color: var(--muted); word-break: break-all;
+                      font-family: ui-monospace, monospace; font-size: 11px; }
+  .card .info .size { color: var(--fg); }
+  .card .actions { display: flex; }
+  .card .actions button { flex: 1; border: 0; padding: 10px;
+                          background: #333; color: var(--fg); cursor: pointer;
+                          font-size: 13px; }
+  .card .actions .keep-btn:hover, .card.keep .actions .keep-btn { background: var(--keep); }
+  .card .actions .dupe-btn:hover, .card.dupe .actions .dupe-btn { background: var(--dupe); }
+  .empty { padding: 80px 24px; text-align: center; color: var(--muted); }
+  .lightbox { position: fixed; inset: 0; background: rgba(0,0,0,0.95);
+              display: none; align-items: center; justify-content: center;
+              z-index: 100; cursor: zoom-out; }
+  .lightbox.show { display: flex; }
+  .lightbox img { max-width: 95vw; max-height: 95vh; object-fit: contain; }
+  .help { font-size: 11px; color: var(--muted); padding: 0 24px 16px;
+          font-family: ui-monospace, monospace; }
+  .help kbd { background: #333; padding: 2px 6px; border-radius: 3px;
+              border: 1px solid #444; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>dedupe-images review</h1>
+    <div class="meta" id="meta">loading...</div>
+  </div>
+  <div class="nav">
+    <button id="prev" title="Previous (←)">←</button>
+    <button id="next" title="Next (→ or space)">→</button>
+    <button id="commit" title="Commit (c)">Commit moves</button>
+  </div>
+</header>
+
+<div class="cluster-info" id="clusterInfo"></div>
+<div class="help">
+  <kbd>1</kbd>–<kbd>9</kbd> mark Nth as keep ·
+  <kbd>a</kbd> all keep · <kbd>d</kbd> all dupe ·
+  <kbd>←</kbd>/<kbd>→</kbd> nav · <kbd>space</kbd> next · <kbd>c</kbd> commit ·
+  click image to zoom
+</div>
+<div class="grid" id="grid"></div>
+
+<div class="lightbox" id="lightbox" onclick="this.classList.remove('show')">
+  <img id="lightboxImg">
+</div>
+
+<script>
+let clusters = [];
+let cur = 0;
+let decisions = {};  // path -> "keep" | "dupe"
+
+async function load() {
+  const r = await fetch('/api/clusters');
+  const data = await r.json();
+  clusters = data.clusters;
+  decisions = data.defaults;
+  if (!clusters.length) {
+    document.getElementById('grid').innerHTML =
+      '<div class="empty">No duplicate clusters found. Nothing to review.</div>';
+    document.getElementById('meta').textContent = '0 clusters';
+    document.getElementById('commit').disabled = true;
+    return;
+  }
+  render();
+}
+
+function render() {
+  const c = clusters[cur];
+  const meta = document.getElementById('meta');
+  meta.textContent = `cluster ${cur + 1} of ${clusters.length} · tier ${c.tier} · ${c.files.length} files`;
+
+  const info = document.getElementById('clusterInfo');
+  info.innerHTML = `<b>${tierLabel(c.tier)}</b> · pick what to keep, the rest move to <b>${c.quarantine}</b>`;
+
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+  c.files.forEach((f, i) => {
+    const card = document.createElement('div');
+    card.className = 'card ' + (decisions[f.path] || 'keep');
+    card.innerHTML = `
+      <img loading="lazy" src="/api/thumb?path=${encodeURIComponent(f.path)}&w=720"
+           data-full="/api/image?path=${encodeURIComponent(f.path)}">
+      <div class="info">
+        <div><span class="num">${i + 1}</span><span class="size">${fmtBytes(f.size)}</span></div>
+        <div class="path">${f.path}</div>
+      </div>
+      <div class="actions">
+        <button class="keep-btn">Keep</button>
+        <button class="dupe-btn">Dupe</button>
+      </div>`;
+    card.querySelector('.keep-btn').onclick = () => mark(f.path, 'keep');
+    card.querySelector('.dupe-btn').onclick = () => mark(f.path, 'dupe');
+    card.querySelector('img').onclick = (e) => {
+      const lb = document.getElementById('lightbox');
+      document.getElementById('lightboxImg').src = e.target.dataset.full;
+      lb.classList.add('show');
+    };
+    grid.appendChild(card);
+  });
+  updateCommit();
+}
+
+function tierLabel(t) {
+  return {
+    1: 'Tier 1 — byte-identical',
+    2: 'Tier 2 — same pixels, metadata differs',
+    3: 'Tier 3 — perceptually similar (eyeball this)',
+  }[t] || 'cluster';
+}
+
+function fmtBytes(n) {
+  const u = ['B', 'KB', 'MB', 'GB'];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(1) + ' ' + u[i];
+}
+
+function mark(path, action) {
+  decisions[path] = action;
+  render();
+}
+
+function markAll(action) {
+  clusters[cur].files.forEach(f => decisions[f.path] = action);
+  render();
+}
+
+function pickOnly(idx) {
+  const c = clusters[cur];
+  c.files.forEach((f, i) => {
+    decisions[f.path] = (i === idx) ? 'keep' : 'dupe';
+  });
+  render();
+}
+
+function go(delta) {
+  cur = Math.max(0, Math.min(clusters.length - 1, cur + delta));
+  render();
+}
+
+function updateCommit() {
+  const total = Object.values(decisions).filter(d => d === 'dupe').length;
+  document.getElementById('commit').textContent =
+    total > 0 ? `Commit (${total} moves)` : 'Commit (nothing to move)';
+  document.getElementById('commit').disabled = total === 0;
+}
+
+async function commit() {
+  if (!confirm(`Move ${Object.values(decisions).filter(d => d === 'dupe').length} files to quarantine?`)) return;
+  const r = await fetch('/api/commit', {
+    method: 'POST',
+    headers: {'content-type': 'application/json'},
+    body: JSON.stringify({decisions}),
+  });
+  const data = await r.json();
+  document.body.innerHTML = `<div class="empty"><h2>Done.</h2>
+    <p>${data.moved} file(s) moved · ${data.bytes} bytes reclaimable</p>
+    <p>Quarantine: <code>${data.quarantine}</code></p>
+    <p>You can close this tab.</p></div>`;
+  setTimeout(() => fetch('/api/shutdown', {method: 'POST'}).catch(()=>{}), 500);
+}
+
+document.getElementById('prev').onclick = () => go(-1);
+document.getElementById('next').onclick = () => go(1);
+document.getElementById('commit').onclick = commit;
+
+document.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT') return;
+  if (document.getElementById('lightbox').classList.contains('show')) {
+    if (e.key === 'Escape') document.getElementById('lightbox').classList.remove('show');
+    return;
+  }
+  if (e.key === 'ArrowLeft') go(-1);
+  else if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); go(1); }
+  else if (e.key === 'a') markAll('keep');
+  else if (e.key === 'd') markAll('dupe');
+  else if (e.key === 'c') commit();
+  else if (e.key >= '1' && e.key <= '9') {
+    const idx = parseInt(e.key) - 1;
+    if (clusters[cur] && idx < clusters[cur].files.length) pickOnly(idx);
+  }
+});
+
+load();
+</script>
+</body>
+</html>"""
+
+
+def serialize_clusters_for_review(
+    by_tier: dict[int, list[list[tuple[Path, int]]]],
+    keep_strategy: str,
+    quarantine: Path,
+) -> tuple[list[dict], dict[str, str]]:
+    """Flatten by_tier into a list of cluster dicts and a default-decisions map."""
+    clusters = []
+    defaults: dict[str, str] = {}
+    for tier in (1, 2, 3):
+        for group in by_tier[tier]:
+            keep_i = keep_index(group, keep_strategy)
+            files_payload = [{"path": str(f), "size": sz} for f, sz in group]
+            clusters.append({
+                "tier": tier,
+                "files": files_payload,
+                "quarantine": str(quarantine),
+            })
+            for i, (f, _) in enumerate(group):
+                defaults[str(f)] = "keep" if i == keep_i else "dupe"
+    return clusters, defaults
+
+
+def run_review_server(
+    by_tier: dict[int, list[list[tuple[Path, int]]]],
+    quarantine: Path,
+    keep_strategy: str,
+    flat: bool,
+    port: int,
+) -> int:
+    try:
+        from flask import Flask, abort, jsonify, request, Response
+    except ImportError:
+        print("Flask not available. Run via `uv run` to auto-install.", file=sys.stderr)
+        return 1
+
+    # Path whitelist: only paths from the actual scan can be served.
+    allowed_paths: set[str] = set()
+    for tier in (1, 2, 3):
+        for group in by_tier[tier]:
+            for f, _ in group:
+                allowed_paths.add(str(f.resolve()))
+
+    clusters, defaults = serialize_clusters_for_review(by_tier, keep_strategy, quarantine)
+    shutdown_event = threading.Event()
+
+    app = Flask(__name__)
+
+    @app.route("/")
+    def index():
+        return Response(REVIEW_HTML, mimetype="text/html; charset=utf-8")
+
+    @app.route("/api/clusters")
+    def api_clusters():
+        return jsonify({"clusters": clusters, "defaults": defaults})
+
+    def resolve_allowed(qpath: str) -> Path:
+        try:
+            p = Path(urllib.parse.unquote(qpath)).resolve()
+        except Exception:
+            abort(400)
+        if str(p) not in allowed_paths:
+            abort(403)
+        return p
+
+    @app.route("/api/image")
+    def api_image():
+        qpath = request.args.get("path", "")
+        p = resolve_allowed(qpath)
+        if not p.exists():
+            abort(404)
+        ext = p.suffix.lower().lstrip(".")
+        mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp",
+                "tif": "image/tiff", "tiff": "image/tiff",
+                "heic": "image/heic", "heif": "image/heif"}.get(ext, "application/octet-stream")
+        return Response(p.read_bytes(), mimetype=mime)
+
+    @app.route("/api/thumb")
+    def api_thumb():
+        qpath = request.args.get("path", "")
+        try:
+            w = int(request.args.get("w", "720"))
+        except ValueError:
+            w = 720
+        w = max(64, min(2048, w))
+        p = resolve_allowed(qpath)
+        if not p.exists():
+            abort(404)
+        try:
+            with Image.open(p) as img:
+                img.thumbnail((w, w * 4), Image.Resampling.LANCZOS)
+                if img.mode not in ("RGB", "RGBA"):
+                    img = img.convert("RGB")
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=82)
+                return Response(buf.getvalue(), mimetype="image/jpeg",
+                                headers={"Cache-Control": "max-age=3600"})
+        except Exception as e:
+            print(f"  thumb error on {p}: {e}", file=sys.stderr)
+            abort(500)
+
+    @app.route("/api/commit", methods=["POST"])
+    def api_commit():
+        payload = request.get_json(silent=True) or {}
+        decisions = payload.get("decisions", {})
+        moves: list[tuple[Path, int]] = []
+        for path_str, action in decisions.items():
+            if action != "dupe":
+                continue
+            if path_str not in allowed_paths:
+                continue
+            p = Path(path_str)
+            if not p.exists():
+                continue
+            try:
+                moves.append((p, p.stat().st_size))
+            except OSError:
+                continue
+
+        q = quarantine.expanduser().resolve()
+        q.mkdir(parents=True, exist_ok=True)
+        moved = 0
+        moved_bytes = 0
+        for f, sz in moves:
+            target = q / f.name if flat else q / Path(*f.parts[1:])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                target = target.with_name(
+                    f"{target.stem}.{int(time.time())}{target.suffix}"
+                )
+            try:
+                shutil.move(str(f), str(target))
+                moved += 1
+                moved_bytes += sz
+            except OSError as e:
+                print(f"  move failed: {f}: {e}", file=sys.stderr)
+        print(f"\nQuarantined {moved} file(s), {fmt_bytes(moved_bytes)} -> {q}",
+              file=sys.stderr)
+        return jsonify({"moved": moved, "bytes": fmt_bytes(moved_bytes),
+                        "quarantine": str(q)})
+
+    @app.route("/api/shutdown", methods=["POST"])
+    def api_shutdown():
+        shutdown_event.set()
+        return jsonify({"ok": True})
+
+    # Start server in background thread so we can wait on shutdown_event in main.
+    from werkzeug.serving import make_server
+    server = make_server("127.0.0.1", port, app, threaded=True)
+    actual_port = server.server_port
+    url = f"http://127.0.0.1:{actual_port}/"
+
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    print(f"\n  Review UI: {url}", file=sys.stderr)
+    print(f"  Open it in your browser to review {len(clusters)} cluster(s).", file=sys.stderr)
+    print(f"  Press Ctrl-C in this terminal to stop the server.\n", file=sys.stderr)
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+    try:
+        # Wait for either /api/shutdown or Ctrl-C
+        while not shutdown_event.wait(timeout=0.5):
+            pass
+    except KeyboardInterrupt:
+        print("\nShutting down.", file=sys.stderr)
+    finally:
+        server.shutdown()
+
+    return 0
+
+
 # ---------- main ----------
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Three-tier image deduplication.",
+        description="Three-tier image deduplication with optional web review UI.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -189,16 +715,25 @@ def main() -> int:
     ap.add_argument("--allow-photos-internals", action="store_true",
                     help="Scan inside *.photoslibrary/resources/derivatives/. Off by default.")
     ap.add_argument("--quarantine", type=Path, default=None,
-                    help="Move all-but-one of each cluster to this dir (no deletes).")
+                    help="Move all-but-one of each cluster to this dir (no deletes). "
+                         "Required with --review.")
     ap.add_argument("--keep", choices=["oldest", "newest", "largest", "smallest", "first"],
                     default="largest", help="Which file in each cluster to keep (default: largest).")
     ap.add_argument("--json", type=Path, default=None, help="Write JSON report to this path.")
     ap.add_argument("--min-size", type=int, default=1024,
                     help="Skip files smaller than this many bytes (default: 1024).")
     ap.add_argument("--dry-run", action="store_true",
-                    help="With --quarantine, print what would move without moving anything.")
+                    help="With --quarantine (CLI mode), print what would move without moving.")
+    ap.add_argument("--flat", action="store_true",
+                    help="With --quarantine, drop files at the top level instead of "
+                         "preserving their absolute path.")
     ap.add_argument("--skip-tier3", action="store_true",
                     help="Skip perceptual hashing. Much faster on huge sets.")
+    ap.add_argument("--review", action="store_true",
+                    help="Open a web UI to eyeball each cluster and pick what to keep. "
+                         "Requires --quarantine. Default --keep choice pre-selects, you override.")
+    ap.add_argument("--port", type=int, default=0,
+                    help="Port for --review server. Default 0 = auto-pick free port.")
     args = ap.parse_args()
 
     roots = [Path(p).expanduser().resolve() for p in args.paths]
@@ -207,109 +742,24 @@ def main() -> int:
             print(f"Path not found: {r}", file=sys.stderr)
             return 1
 
-    print(f"Scanning {len(roots)} root(s)...", file=sys.stderr)
-    files: list[tuple[Path, int]] = []
-    for f in walk_images(roots, args.allow_photos_internals):
-        try:
-            sz = f.stat().st_size
-        except OSError:
-            continue
-        if sz < args.min_size:
-            continue
-        files.append((f, sz))
-    print(f"Found {len(files)} candidate images", file=sys.stderr)
-    if not files:
+    if args.review and args.quarantine is None:
+        print("--review requires --quarantine to know where dupes go.", file=sys.stderr)
+        return 1
+
+    by_tier = compute_clusters(
+        roots,
+        threshold=args.threshold,
+        allow_photos=args.allow_photos_internals,
+        min_size=args.min_size,
+        skip_tier3=args.skip_tier3,
+    )
+
+    if not any(by_tier.values()):
+        print("\nNo duplicate clusters found.", file=sys.stderr)
         return 0
 
-    n = len(files)
-    uf = UF(n)
-
-    # Tier 1: file SHA
-    by_sha: dict[str, list[int]] = defaultdict(list)
-    for i, (f, _) in enumerate(files):
-        try:
-            by_sha[sha256_file(f)].append(i)
-        except OSError as e:
-            print(f"\n  read error on {f}: {e}", file=sys.stderr)
-        if (i + 1) % 25 == 0 or i == n - 1:
-            progress("Tier 1 (file SHA)    ", i + 1, n)
-    for indices in by_sha.values():
-        for j in indices[1:]:
-            uf.union(indices[0], j, tier=1)
-
-    # Tier 2: pixel SHA on one representative per tier-1 cluster.
-    # Compute on UF roots that have at least one entry, but here we just iterate
-    # representatives = one index per file SHA group (since multiple files with
-    # the same file SHA are already unified at tier 1).
-    tier1_reps = [grp[0] for grp in by_sha.values()]
-    by_pixels: dict[str, list[int]] = defaultdict(list)
-    for k, idx in enumerate(tier1_reps, 1):
-        f, _ = files[idx]
-        ph = pixel_sha256(f)
-        if ph is not None:
-            by_pixels[ph].append(idx)
-        if k % 25 == 0 or k == len(tier1_reps):
-            progress("Tier 2 (pixel SHA)   ", k, len(tier1_reps))
-    for indices in by_pixels.values():
-        for j in indices[1:]:
-            uf.union(indices[0], j, tier=2)
-
-    # Tier 3: perceptual hashing on one rep per current cluster.
-    if not args.skip_tier3:
-        # Pick one rep per UF cluster (smallest index is fine).
-        rep_for_cluster: dict[int, int] = {}
-        for i in range(n):
-            r = uf.find(i)
-            if r not in rep_for_cluster:
-                rep_for_cluster[r] = i
-        cluster_reps = list(rep_for_cluster.values())
-
-        candidates: list[tuple[int, int, int]] = []  # (file_idx, dhash, phash)
-        for k, idx in enumerate(cluster_reps, 1):
-            f, _ = files[idx]
-            d, p = perceptual_hashes(f)
-            if d is not None:
-                candidates.append((idx, d, p))
-            if k % 25 == 0 or k == len(cluster_reps):
-                progress("Tier 3 (perceptual)  ", k, len(cluster_reps))
-
-        # Bucket by top nibble of dHash to reduce comparison count
-        buckets: dict[int, list[int]] = defaultdict(list)
-        for ci, (_, d, _) in enumerate(candidates):
-            buckets[d >> 60].append(ci)
-
-        thr = args.threshold
-        for ci, (idx_a, d1, p1) in enumerate(candidates):
-            top = d1 >> 60
-            adjacent = {b for b in (top - 1, top, top + 1) if 0 <= b <= 0xF}
-            for b in adjacent:
-                for cj in buckets.get(b, []):
-                    if cj <= ci:
-                        continue
-                    idx_b, d2, p2 = candidates[cj]
-                    if hamming(d1, d2) <= thr and hamming(p1, p2) <= thr:
-                        uf.union(idx_a, idx_b, tier=3)
-
-    # Build clusters from UF.
-    clusters_by_root: dict[int, list[int]] = defaultdict(list)
-    for i in range(n):
-        clusters_by_root[uf.find(i)].append(i)
-
-    # Filter to dupe clusters and bucket by tier.
-    by_tier: dict[int, list[list[tuple[Path, int]]]] = {1: [], 2: [], 3: []}
-    for root, idxs in clusters_by_root.items():
-        if len(idxs) < 2:
-            continue
-        members = [files[i] for i in idxs]
-        # Within a cluster, find the byte-identical sub-clusters for sub-reporting
-        members.sort(key=lambda fs: str(fs[0]))
-        tier = uf.tier[root]
-        if tier == 0:
-            tier = 1
-        by_tier[tier].append(members)
-
     # Summary
-    def reclaimable(groups: list[list[tuple[Path, int]]]) -> int:
+    def reclaimable(groups):
         return sum(sum(sz for _, sz in g) - max(sz for _, sz in g) for g in groups)
 
     print()
@@ -322,11 +772,19 @@ def main() -> int:
         if t == 3 and args.skip_tier3:
             continue
         groups = by_tier[t]
-        n_groups = len(groups)
-        n_extras = sum(len(g) - 1 for g in groups)
-        s = reclaimable(groups)
-        print(f"{labels[t]} {n_groups:4d} clusters, {n_extras:4d} extras, "
-              f"{fmt_bytes(s):>10s} reclaimable")
+        print(f"{labels[t]} {len(groups):4d} clusters, "
+              f"{sum(len(g) - 1 for g in groups):4d} extras, "
+              f"{fmt_bytes(reclaimable(groups)):>10s} reclaimable")
+
+    # --review takes the interactive path and returns
+    if args.review:
+        return run_review_server(
+            by_tier=by_tier,
+            quarantine=args.quarantine,
+            keep_strategy=args.keep,
+            flat=args.flat,
+            port=args.port,
+        )
 
     # JSON report
     if args.json:
@@ -344,7 +802,7 @@ def main() -> int:
         with open(args.json, "w") as fp:
             json.dump(payload, fp, indent=2)
         print(f"\nJSON report: {args.json}", file=sys.stderr)
-    elif any(by_tier.values()):
+    elif not args.quarantine:
         print()
         for t in (1, 2, 3):
             groups = by_tier[t]
@@ -361,7 +819,7 @@ def main() -> int:
                     print(f"  [{marker}] {fmt_bytes(sz):>9s}  {f}")
                 print()
 
-    # Quarantine: walk every cluster exactly once.
+    # Quarantine (CLI mode, non-interactive)
     if args.quarantine:
         q = args.quarantine.expanduser().resolve()
         if not args.dry_run:
@@ -374,7 +832,7 @@ def main() -> int:
                 for i, (f, sz) in enumerate(group):
                     if i == keep_i:
                         continue
-                    target = q / Path(*f.parts[1:])
+                    target = q / f.name if args.flat else q / Path(*f.parts[1:])
                     if args.dry_run:
                         print(f"[dry-run] would move {f} -> {target}", file=sys.stderr)
                     else:

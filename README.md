@@ -18,6 +18,25 @@ Example: A and C are byte-identical, A/B/C are pixel-identical, and D is percept
 
 If you want only the higher-confidence relationships, run `--skip-tier3`. The same A/B/C/D set then reports A/B/C as a Tier 2 cluster and D drops out entirely.
 
+## Web review UI
+
+Run with `--review` to eyeball each cluster in your browser before any files move:
+
+```bash
+uv run ~/dedupe-images/dedupe_images.py --review --quarantine ~/dupe-quarantine --flat ~/Pictures
+```
+
+This pops a local web page where you scroll through clusters, see all images side-by-side, and decide what to keep. The default `--keep` strategy pre-marks one file per cluster; you override with a click or keystroke.
+
+**Keyboard shortcuts:**
+- `1`–`9` mark the Nth image as keep, others as dupe
+- `a` mark all in cluster as keep · `d` mark all as dupe
+- `←` / `→` (or space) navigate clusters
+- `c` commit moves
+- click any image to zoom
+
+The server runs on a random local port (override with `--port N`) and shuts down after you commit. Nothing is moved until you click commit.
+
 ## Default behavior is safe
 
 - **Nothing is deleted.** Default action is a printed report. Add `--quarantine <dir>` to **move** all-but-one of each duplicate group into a holding directory you can review and empty yourself.
