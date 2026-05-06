@@ -168,6 +168,26 @@ uv run ~/dedupe-images/dedupe_images.py --review --photos-library \
 
 **iCloud-only photos** (not downloaded to disk) are skipped silently. To force-download for dedup, run `osxphotos export --download-missing` first or open them in Photos.app to trigger a download.
 
+## Mac app bundle
+
+A clickable `.app` bundle is available for users who want a Dock-icon launch:
+
+```bash
+bash macapp/build-app.sh
+open macapp/dist/DedupeImages.app
+```
+
+Double-click pops a folder picker, then opens a Terminal window running `--review` against the chosen folder, with quarantine at `~/dedupe-quarantine`. The app is unsigned — macOS will warn the first time; right-click → Open to bypass.
+
+The bundle includes the **Swift CLI** under `Contents/Resources/dedupe-images-swift` for users who prefer the native binary path. The Swift port covers Tier 1 (CryptoKit SHA-256) and Tier 3 (CoreGraphics-based dHash); Tiers 2/4/5 still require the Python tool.
+
+To build the Swift CLI standalone:
+
+```bash
+cd swift && swift build -c release
+./.build/release/DedupeImagesCLI ~/path/to/scan
+```
+
 ## Tests
 
 ```bash

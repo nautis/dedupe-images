@@ -10,6 +10,8 @@
 #     "PyMuPDF>=1.24",
 #     "osxphotos>=0.75",
 #     "pyobjc-framework-Photos>=10.0; sys_platform == 'darwin'",
+#     "imageio-ffmpeg>=0.5",
+#     "imageio>=2.34",
 # ]
 # ///
 """
@@ -83,6 +85,12 @@ try:
 except ImportError:
     HAVE_OSXPHOTOS = False
 
+try:
+    import imageio.v3 as iio
+    HAVE_IMAGEIO = True
+except ImportError:
+    HAVE_IMAGEIO = False
+
 IMAGE_EXTS = {
     ".jpg", ".jpeg", ".png", ".heic", ".heif",
     ".webp", ".tiff", ".tif", ".bmp", ".gif",
@@ -90,7 +98,9 @@ IMAGE_EXTS = {
 RAW_EXTS = {".cr2", ".cr3", ".nef", ".nrw", ".arw", ".srf", ".sr2",
             ".dng", ".raf", ".rw2", ".orf", ".pef", ".rwl", ".x3f"}
 PDF_EXTS = {".pdf"}
-SCAN_EXTS = IMAGE_EXTS | RAW_EXTS | PDF_EXTS
+VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".wmv", ".webm",
+              ".flv", ".mpg", ".mpeg", ".3gp", ".m2ts", ".mts", ".ts"}
+SCAN_EXTS = IMAGE_EXTS | RAW_EXTS | PDF_EXTS  # video is opt-in via --include-video
 
 PHOTOS_DERIV_MARKER = ".photoslibrary/resources/derivatives"
 
@@ -140,6 +150,89 @@ def perceptual_hashes(path: Path) -> tuple[int, int] | tuple[None, None]:
         return (None, None)
 
 
+def exif_tags(path: Path) -> dict[str, str]:
+    """Return a small dict of EXIF tags useful for renaming templates.
+    Keys: datetime (raw 'YYYY:MM:DD HH:MM:SS'), make, model, iso."""
+    out: dict[str, str] = {}
+    try:
+        with Image.open(path) as img:
+            exif = img.getexif()
+            if not exif:
+                return out
+            # Top-level IFD0 tags: 306=DateTime, 271=Make, 272=Model
+            for tag, key in ((306, "datetime_alt"),
+                             (271, "make"), (272, "model")):
+                v = exif.get(tag)
+                if v is not None:
+                    out[key] = str(v).strip()
+            # Exif sub-IFD (0x8769) holds DateTimeOriginal (36867) and ISO (34855)
+            try:
+                exif_ifd = exif.get_ifd(0x8769)
+                for tag, key in ((36867, "datetime"), (34855, "iso")):
+                    v = exif_ifd.get(tag)
+                    if v is not None:
+                        out[key] = str(v).strip()
+            except (KeyError, AttributeError):
+                pass
+            if "datetime" not in out and "datetime_alt" in out:
+                out["datetime"] = out["datetime_alt"]
+    except Exception:
+        pass
+    return out
+
+
+def render_rename_template(path: Path, template: str, seq: int = 0) -> str:
+    """Render a rename template. Tokens:
+
+      {stem}           original filename without extension
+      {ext}            extension with leading dot (e.g. '.jpg')
+      {parent}         parent directory name
+      {seq}            sequence number (zero-padded to 4)
+      {sha256_8}       first 8 chars of file SHA-256
+      {exif:make}      EXIF Make field
+      {exif:model}     EXIF Model field
+      {exif:datetime|FORMAT}   EXIF DateTimeOriginal formatted (strftime).
+                       Default format: %Y-%m-%d_%H%M%S
+    """
+    import re as _re
+    from datetime import datetime as _dt
+
+    def _replace(match: "_re.Match[str]") -> str:
+        token = match.group(1)
+        if token == "stem":
+            return path.stem
+        if token == "ext":
+            return path.suffix
+        if token == "parent":
+            return path.parent.name
+        if token == "seq":
+            return f"{seq:04d}"
+        if token == "sha256_8":
+            try:
+                return sha256_file(path)[:8]
+            except OSError:
+                return "0" * 8
+        if token.startswith("exif:"):
+            rest = token[5:]
+            if rest.startswith("datetime"):
+                fmt = "%Y-%m-%d_%H%M%S"
+                if "|" in rest:
+                    fmt = rest.split("|", 1)[1]
+                tags = exif_tags(path)
+                raw = tags.get("datetime")
+                if not raw:
+                    return ""
+                try:
+                    return _dt.strptime(raw, "%Y:%m:%d %H:%M:%S").strftime(fmt)
+                except ValueError:
+                    return ""
+            tags = exif_tags(path)
+            return tags.get(rest, "")
+        return ""
+
+    return _re.sub(r"\{([^}]+)\}", _replace, template)
+
+
 def exif_datetime_unix(path: Path) -> int | None:
     """Return EXIF DateTimeOriginal as a unix timestamp, or None if absent.
 
@@ -172,6 +265,48 @@ def exif_datetime_unix(path: Path) -> int | None:
 
 def hamming(a: int, b: int) -> int:
     return (a ^ b).bit_count()
+
+
+def video_fingerprint(path: Path, n_frames: int = 9) -> list[int] | None:
+    """Extract n_frames evenly-spaced from a video, return list of dHash ints.
+    Returns None if extraction fails."""
+    if not HAVE_IMAGEIO:
+        return None
+    try:
+        with iio.imopen(path, "r", plugin="pyav") as f:
+            meta = f.metadata()
+            n_total = meta.get("n_frames")
+            if not n_total or n_total <= 0:
+                # Fall back: read all frames and count
+                frames = list(iio.imiter(path, plugin="pyav"))
+                n_total = len(frames)
+                if n_total == 0:
+                    return None
+                indices = [int(i * (n_total - 1) / max(1, n_frames - 1))
+                           for i in range(n_frames)]
+                sampled = [frames[i] for i in indices if i < len(frames)]
+            else:
+                indices = [int(i * (n_total - 1) / max(1, n_frames - 1))
+                           for i in range(n_frames)]
+                sampled = [iio.imread(path, plugin="pyav", index=i) for i in indices]
+        hashes: list[int] = []
+        for arr in sampled:
+            img = Image.fromarray(arr).convert("L")
+            hashes.append(int(str(imagehash.dhash(img)), 16))
+        return hashes
+    except Exception:
+        return None
+
+
+def video_fingerprint_distance(a: list[int], b: list[int],
+                                threshold: int = 8) -> float:
+    """Return fraction of frames where hashes match within threshold.
+    1.0 = all frames match, 0.0 = none. Compares positionally (assumes same
+    n_frames)."""
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    matches = sum(1 for x, y in zip(a, b) if hamming(x, y) <= threshold)
+    return matches / len(a)
 
 
 def _glob_to_regex(pattern: str) -> "re.Pattern[str]":
@@ -308,6 +443,199 @@ def handle_photos_dupes(
     )
 
 
+def handle_lightroom_dupes(
+    lr_ids: list[int],
+    pairs: list[tuple[str, int]],  # [(path, lr_id), ...]
+    catalog_path: Path,
+    quarantine: Path,
+    mode: str,
+) -> tuple[int, str]:
+    """Queue Lightroom dupes for export or direct rejection."""
+    if not lr_ids:
+        return 0, ""
+    quarantine.mkdir(parents=True, exist_ok=True)
+    export_path = quarantine / "lightroom-to-reject.json"
+    payload = {
+        "catalog": str(catalog_path),
+        "lr_ids": lr_ids,
+        "files": [{"path": p, "lr_id": i} for p, i in pairs],
+        "note": "These Adobe_images.id_local rows in the .lrcat are dupes. "
+                "Re-run with --lightroom-mode reject (with Lightroom CLOSED) "
+                "to set pick=-1 on these rows.",
+    }
+    with open(export_path, "w") as fp:
+        json.dump(payload, fp, indent=2)
+    if mode == "export":
+        return len(lr_ids), (
+            f"Wrote {len(lr_ids)} Lightroom row id(s) to {export_path}.")
+    # mode == 'reject'
+    try:
+        n = mark_lightroom_rejected(catalog_path, lr_ids)
+        return n, (f"Marked {n} Lightroom photo(s) as Reject (pick=-1). "
+                   f"Open Lightroom and they'll show with the reject flag.")
+    except Exception as e:
+        return 0, (f"Lightroom write failed: {e}. "
+                   f"Make sure Lightroom is closed. ids preserved at {export_path}.")
+
+
+def handle_capture_one_dupes(
+    asset_ids: list[str],
+    pairs: list[tuple[str, str]],
+    quarantine: Path,
+) -> tuple[int, str]:
+    """Capture One write-back is export-only (schema undocumented)."""
+    if not asset_ids:
+        return 0, ""
+    quarantine.mkdir(parents=True, exist_ok=True)
+    export_path = quarantine / "captureone-to-delete.json"
+    payload = {
+        "asset_ids": asset_ids,
+        "files": [{"path": p, "asset_id": i} for p, i in pairs],
+        "note": "Capture One asset ids identified as dupes. Open Capture One, "
+                "search by filename and delete manually. (Direct catalog "
+                "modification not supported in this version.)",
+    }
+    with open(export_path, "w") as fp:
+        json.dump(payload, fp, indent=2)
+    return len(asset_ids), f"Wrote {len(asset_ids)} Capture One id(s) to {export_path}."
+
+
+def walk_lightroom_catalog(catalog_path: Path,
+                           log_progress: bool = True
+                           ) -> tuple[list[tuple[Path, int]], dict[str, int]]:
+    """Enumerate originals from a Lightroom Classic .lrcat catalog.
+
+    Returns (file_list, lr_id_by_path) where lr_id is Adobe_images.id_local
+    used by mark_lightroom_rejected for write-back.
+
+    UNTESTED against a real catalog in this session - may need tuning if
+    Adobe changes the schema in newer LR versions.
+    """
+    import sqlite3 as _sqlite3
+    if not catalog_path.exists():
+        raise FileNotFoundError(f"Lightroom catalog not found: {catalog_path}")
+    if log_progress:
+        print(f"Reading Lightroom catalog {catalog_path}...", file=sys.stderr)
+    uri = f"file:{catalog_path}?mode=ro"
+    conn = _sqlite3.connect(uri, uri=True)
+    try:
+        cur = conn.execute("""
+            SELECT
+                ai.id_local,
+                rf.absolutePath,
+                af.pathFromRoot,
+                af.baseName,
+                af.extension
+            FROM Adobe_images ai
+            JOIN AgLibraryFile af ON ai.rootFile = af.id_local
+            JOIN AgLibraryRootFolder rf ON af.rootFolder = rf.id_local
+        """)
+        files: list[tuple[Path, int]] = []
+        lr_id_by_path: dict[str, int] = {}
+        for row in cur:
+            lr_id, abs_path, sub_path, base, ext = row
+            full = Path(abs_path) / (sub_path or "") / f"{base}.{ext}"
+            if not full.exists():
+                continue
+            try:
+                sz = full.stat().st_size
+            except OSError:
+                continue
+            files.append((full, sz))
+            lr_id_by_path[str(full.resolve())] = lr_id
+    finally:
+        conn.close()
+    if log_progress:
+        print(f"  {len(files)} originals readable from catalog",
+              file=sys.stderr)
+    return files, lr_id_by_path
+
+
+def mark_lightroom_rejected(catalog_path: Path, lr_ids: list[int]) -> int:
+    """Set pick (-1 = Reject) on the given Adobe_images rows. Catalog must
+    NOT be open in Lightroom; SQLite WAL lock will error otherwise."""
+    import sqlite3 as _sqlite3
+    if not lr_ids:
+        return 0
+    conn = _sqlite3.connect(str(catalog_path))
+    try:
+        for col in ("pick", "pick_status"):
+            try:
+                placeholders = ",".join("?" * len(lr_ids))
+                cur = conn.execute(
+                    f"UPDATE Adobe_images SET {col} = -1 "
+                    f"WHERE id_local IN ({placeholders})",
+                    lr_ids,
+                )
+                conn.commit()
+                return cur.rowcount
+            except _sqlite3.OperationalError:
+                continue
+        return 0
+    finally:
+        conn.close()
+
+
+def walk_capture_one_catalog(catalog_path: Path,
+                             log_progress: bool = True
+                             ) -> tuple[list[tuple[Path, int]], dict[str, str]]:
+    """Best-effort enumeration of a Capture One catalog. Schema is undocumented;
+    probes for likely table/column names. UNTESTED against a real catalog."""
+    import sqlite3 as _sqlite3
+    if catalog_path.is_dir():
+        db_candidates = list(catalog_path.glob("*.cocatalogdb"))
+        if not db_candidates:
+            raise FileNotFoundError(
+                f"No .cocatalogdb in {catalog_path}")
+        db_path = db_candidates[0]
+    else:
+        db_path = catalog_path
+    if log_progress:
+        print(f"Reading Capture One catalog {db_path}...", file=sys.stderr)
+    uri = f"file:{db_path}?mode=ro"
+    conn = _sqlite3.connect(uri, uri=True)
+    try:
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")
+        tables = {r[0] for r in cur}
+        candidates = ["ZIMAGE", "Image", "Asset", "ZASSET"]
+        table = next((t for t in candidates if t in tables), None)
+        if table is None:
+            raise RuntimeError(
+                f"Capture One schema not recognized. Tables: {sorted(tables)}")
+        cur = conn.execute(f"PRAGMA table_info({table})")
+        cols = [r[1] for r in cur]
+        path_col = next((c for c in cols
+                         if c.lower() in ("zpath", "path", "filepath",
+                                          "zoriginalpath")), None)
+        if not path_col:
+            raise RuntimeError(
+                f"Could not locate path column in {table}. Columns: {cols}")
+        id_col = "Z_PK" if "Z_PK" in cols else (
+            "id_local" if "id_local" in cols else cols[0])
+        rows = conn.execute(f"SELECT {id_col}, {path_col} FROM {table}").fetchall()
+        files: list[tuple[Path, int]] = []
+        id_by_path: dict[str, str] = {}
+        for asset_id, path_val in rows:
+            if not path_val:
+                continue
+            p = Path(path_val).expanduser()
+            if not p.exists():
+                continue
+            try:
+                sz = p.stat().st_size
+            except OSError:
+                continue
+            files.append((p, sz))
+            id_by_path[str(p.resolve())] = str(asset_id)
+        if log_progress:
+            print(f"  {len(files)} originals readable from catalog",
+                  file=sys.stderr)
+        return files, id_by_path
+    finally:
+        conn.close()
+
+
 def walk_photos_library(library_path: Path | None = None,
                         skip_missing: bool = True,
                         log_progress: bool = True
@@ -356,15 +684,20 @@ def walk_photos_library(library_path: Path | None = None,
     return files, uuid_by_path
 
 
-def walk_images(roots: list[Path], allow_photos: bool):
+def walk_images(roots: list[Path], allow_photos: bool, include_video: bool = False):
+    exts = SCAN_EXTS | VIDEO_EXTS if include_video else SCAN_EXTS
     for root in roots:
         for dirpath, dirnames, filenames in os.walk(root):
             if not allow_photos and PHOTOS_DERIV_MARKER in dirpath:
                 dirnames[:] = []
                 continue
             for name in filenames:
-                if Path(name).suffix.lower() in SCAN_EXTS:
+                if Path(name).suffix.lower() in exts:
                     yield Path(dirpath) / name
+
+
+def is_video(path: Path) -> bool:
+    return path.suffix.lower() in VIDEO_EXTS
 
 
 def open_canonical_image(path: Path) -> "Image.Image":
@@ -457,6 +790,8 @@ def compute_clusters(
     min_size: int = 1024,
     skip_tier3: bool = False,
     time_gap: int = 0,
+    include_video: bool = False,
+    video_match_ratio: float = 0.8,
     log_progress: bool = True,
 ) -> dict[int, list[list[tuple[Path, int]]]]:
     """Scan roots, run 3-tier dedup, return {tier: [cluster, ...]} where
@@ -476,7 +811,7 @@ def compute_clusters(
         if log_progress:
             print(f"Scanning {len(roots)} root(s)...", file=sys.stderr)
         files = []
-        for f in walk_images(roots, allow_photos):
+        for f in walk_images(roots, allow_photos, include_video=include_video):
             try:
                 sz = f.stat().st_size
             except OSError:
@@ -485,9 +820,11 @@ def compute_clusters(
                 continue
             files.append((f, sz))
         if log_progress:
-            print(f"Found {len(files)} candidate images", file=sys.stderr)
+            print(f"Found {len(files)} candidate items "
+                  f"({sum(1 for f, _ in files if is_video(f))} videos)",
+                  file=sys.stderr)
     if not files:
-        return {1: [], 2: [], 3: [], 4: []}
+        return {1: [], 2: [], 3: [], 4: [], 5: []}
 
     n = len(files)
     uf = UF(n)
@@ -506,28 +843,30 @@ def compute_clusters(
         for j in indices[1:]:
             uf.union(indices[0], j, tier=1)
 
-    # Tier 2
+    # Tier 2 — skip videos
     tier1_reps = [grp[0] for grp in by_sha.values()]
     by_pixels: dict[str, list[int]] = defaultdict(list)
-    for k, idx in enumerate(tier1_reps, 1):
+    image_reps = [idx for idx in tier1_reps if not is_video(files[idx][0])]
+    for k, idx in enumerate(image_reps, 1):
         f, _ = files[idx]
         ph = pixel_sha256(f)
         if ph is not None:
             by_pixels[ph].append(idx)
-        if log_progress and (k % 25 == 0 or k == len(tier1_reps)):
-            progress("Tier 2 (pixel SHA)   ", k, len(tier1_reps))
+        if log_progress and (k % 25 == 0 or k == len(image_reps)):
+            progress("Tier 2 (pixel SHA)   ", k, len(image_reps))
     for indices in by_pixels.values():
         for j in indices[1:]:
             uf.union(indices[0], j, tier=2)
 
-    # Tier 3
+    # Tier 3 — skip videos
     if not skip_tier3:
         rep_for_cluster: dict[int, int] = {}
         for i in range(n):
             r = uf.find(i)
             if r not in rep_for_cluster:
                 rep_for_cluster[r] = i
-        cluster_reps = list(rep_for_cluster.values())
+        cluster_reps = [idx for idx in rep_for_cluster.values()
+                        if not is_video(files[idx][0])]
 
         candidates: list[tuple[int, int, int]] = []
         for k, idx in enumerate(cluster_reps, 1):
@@ -553,6 +892,26 @@ def compute_clusters(
                     if hamming(d1, d2) <= threshold and hamming(p1, p2) <= threshold:
                         uf.union(idx_a, idx_b, tier=3)
 
+    # Tier 5: Video fingerprint matching — compare frame-level dHash sequences.
+    if include_video:
+        video_indices = [i for i, (f, _) in enumerate(files) if is_video(f)]
+        fingerprints: dict[int, list[int]] = {}
+        for k, idx in enumerate(video_indices, 1):
+            f, _ = files[idx]
+            fp = video_fingerprint(f)
+            if fp is not None:
+                fingerprints[idx] = fp
+            if log_progress and (k % 5 == 0 or k == len(video_indices)):
+                progress("Tier 5 (video)       ", k, len(video_indices))
+        # Pairwise — N is small relative to image count.
+        idx_list = sorted(fingerprints.keys())
+        for ai, idx_a in enumerate(idx_list):
+            for idx_b in idx_list[ai + 1:]:
+                ratio = video_fingerprint_distance(
+                    fingerprints[idx_a], fingerprints[idx_b], threshold=threshold)
+                if ratio >= video_match_ratio:
+                    uf.union(idx_a, idx_b, tier=5)
+
     # Tier 4: Series of Shots — union files within `time_gap` seconds.
     if time_gap > 0:
         timestamps: list[tuple[int, int]] = []  # (unix_ts, file_idx)
@@ -575,7 +934,7 @@ def compute_clusters(
     for i in range(n):
         clusters_by_root[uf.find(i)].append(i)
 
-    by_tier: dict[int, list[list[tuple[Path, int]]]] = {1: [], 2: [], 3: [], 4: []}
+    by_tier: dict[int, list[list[tuple[Path, int]]]] = {1: [], 2: [], 3: [], 4: [], 5: []}
     for root, idxs in clusters_by_root.items():
         if len(idxs) < 2:
             continue
@@ -757,6 +1116,7 @@ function tierLabel(t) {
     2: 'Tier 2 — same pixels, metadata differs',
     3: 'Tier 3 — perceptually similar (eyeball this)',
     4: 'Tier 4 — series of shots (eyeball this; subjects may differ)',
+    5: 'Tier 5 — video frame match',
   }[t] || 'cluster';
 }
 
@@ -856,7 +1216,7 @@ def serialize_clusters_for_review(
     uuid_by_path = uuid_by_path or {}
     clusters = []
     defaults: dict[str, str] = {}
-    for tier in (1, 2, 3, 4):
+    for tier in (1, 2, 3, 4, 5):
         for group in by_tier[tier]:
             locked_idx = [i for i, (f, _) in enumerate(group)
                           if is_locked(f, lock_patterns)]
@@ -897,9 +1257,15 @@ def run_review_server(
     lock_patterns: list | None = None,
     uuid_by_path: dict[str, str] | None = None,
     photos_delete_mode: str = "export",
+    lr_id_by_path: dict[str, int] | None = None,
+    lr_catalog: Path | None = None,
+    lr_mode: str = "export",
+    co_id_by_path: dict[str, str] | None = None,
 ) -> int:
     lock_patterns = lock_patterns or []
     uuid_by_path = uuid_by_path or {}
+    lr_id_by_path = lr_id_by_path or {}
+    co_id_by_path = co_id_by_path or {}
     try:
         from flask import Flask, abort, jsonify, request, Response
     except ImportError:
@@ -908,7 +1274,7 @@ def run_review_server(
 
     # Path whitelist: only paths from the actual scan can be served.
     allowed_paths: set[str] = set()
-    for tier in (1, 2, 3, 4):
+    for tier in (1, 2, 3, 4, 5):
         for group in by_tier[tier]:
             for f, _ in group:
                 allowed_paths.add(str(f.resolve()))
@@ -1008,6 +1374,10 @@ def run_review_server(
         moves: list[tuple[Path, int]] = []
         photos_uuids: list[str] = []
         photos_pairs: list[tuple[str, str]] = []
+        lr_ids: list[int] = []
+        lr_pairs: list[tuple[str, int]] = []
+        co_ids: list[str] = []
+        co_pairs: list[tuple[str, str]] = []
         skipped_locked = 0
         for path_str, action in decisions.items():
             if action != "dupe":
@@ -1021,6 +1391,14 @@ def run_review_server(
             if resolved_str in uuid_by_path:
                 photos_uuids.append(uuid_by_path[resolved_str])
                 photos_pairs.append((path_str, uuid_by_path[resolved_str]))
+                continue
+            if resolved_str in lr_id_by_path:
+                lr_ids.append(lr_id_by_path[resolved_str])
+                lr_pairs.append((path_str, lr_id_by_path[resolved_str]))
+                continue
+            if resolved_str in co_id_by_path:
+                co_ids.append(co_id_by_path[resolved_str])
+                co_pairs.append((path_str, co_id_by_path[resolved_str]))
                 continue
             p = Path(path_str)
             if not p.exists():
@@ -1050,19 +1428,32 @@ def run_review_server(
 
         photos_msg = ""
         photos_count = 0
+        lr_count = 0
+        co_count = 0
         if photos_uuids:
             photos_count, photos_msg = handle_photos_dupes(
                 photos_uuids, photos_pairs, q, photos_delete_mode)
             print(photos_msg, file=sys.stderr)
+        if lr_ids and lr_catalog:
+            lr_count, lr_msg = handle_lightroom_dupes(
+                lr_ids, lr_pairs, lr_catalog, q, lr_mode)
+            print(lr_msg, file=sys.stderr)
+            photos_msg = (photos_msg + " " + lr_msg).strip()
+        if co_ids:
+            co_count, co_msg = handle_capture_one_dupes(co_ids, co_pairs, q)
+            print(co_msg, file=sys.stderr)
+            photos_msg = (photos_msg + " " + co_msg).strip()
 
         print(f"\nQuarantined {moved} file(s), {fmt_bytes(moved_bytes)} -> {q}",
               file=sys.stderr)
         return jsonify({
-            "moved": moved + photos_count,
+            "moved": moved + photos_count + lr_count + co_count,
             "bytes": fmt_bytes(moved_bytes),
             "quarantine": str(q),
             "skipped_locked": skipped_locked,
             "photos_handled": photos_count,
+            "lightroom_handled": lr_count,
+            "captureone_handled": co_count,
             "photos_msg": photos_msg,
         })
 
@@ -1123,6 +1514,25 @@ def main() -> int:
                          "UUIDs to <quarantine>/photos-to-delete.json for manual review. "
                          "'delete' calls PhotoKit to send dupes to Photos.app's "
                          "'Recently Deleted' (30-day recoverable).")
+    ap.add_argument("--lightroom-catalog", type=Path, default=None,
+                    metavar="LRCAT",
+                    help="Scan originals from a Lightroom Classic .lrcat catalog. "
+                         "Catalog must not be open in Lightroom.")
+    ap.add_argument("--lightroom-mode", choices=["export", "reject"],
+                    default="export",
+                    help="'export' writes Adobe_images ids to JSON; 'reject' sets "
+                         "pick = -1 directly (Lightroom MUST be closed).")
+    ap.add_argument("--capture-one-catalog", type=Path, default=None,
+                    metavar="COCATALOG",
+                    help="Scan originals from a Capture One .cocatalog. Schema "
+                         "is undocumented; this is best-effort. Write-back is "
+                         "export-only.")
+    ap.add_argument("--rename-pattern", type=str, default=None, metavar="TEMPLATE",
+                    help="On commit, rename the *kept* file in each cluster using "
+                         "this template. Tokens: {stem}, {ext}, {parent}, {seq}, "
+                         "{sha256_8}, {exif:make}, {exif:model}, "
+                         "{exif:datetime|%%Y-%%m-%%d_%%H%%M%%S}. Example: "
+                         "--rename-pattern '{exif:datetime}_{stem}{ext}'")
     ap.add_argument("--threshold", type=int, default=8,
                     help="Max Hamming distance for perceptual match (default: 8). "
                          "0 = pixel-equivalent after rescale; 4-8 = visibly the same; >12 = loose.")
@@ -1151,6 +1561,13 @@ def main() -> int:
                     help="Files matching this glob pattern (relative to a scan root, "
                          "supports **) are treated as 'locked' and cannot be moved. "
                          "Repeatable. Example: --lock-glob '**/keepers/*'")
+    ap.add_argument("--include-video", action="store_true",
+                    help="Also scan video files (.mp4/.mov/.mkv/etc.) and cluster by "
+                         "frame-sampled perceptual hash. Off by default — adds ffmpeg "
+                         "subprocess overhead.")
+    ap.add_argument("--video-match-ratio", type=float, default=0.8,
+                    help="Fraction of sampled video frames that must match (within "
+                         "--threshold) for two videos to cluster. Default 0.8.")
     ap.add_argument("--review", action="store_true",
                     help="Open a web UI to eyeball each cluster and pick what to keep. "
                          "Requires --quarantine. Default --keep choice pre-selects, you override.")
@@ -1164,8 +1581,11 @@ def main() -> int:
             print(f"Path not found: {r}", file=sys.stderr)
             return 1
 
-    if not roots and not args.photos_library:
-        print("No paths given. Pass directories or --photos-library.", file=sys.stderr)
+    if (not roots and not args.photos_library
+            and not args.lightroom_catalog and not args.capture_one_catalog):
+        print("No paths given. Pass directories or "
+              "--photos-library / --lightroom-catalog / --capture-one-catalog.",
+              file=sys.stderr)
         return 1
 
     if args.review and args.quarantine is None:
@@ -1174,27 +1594,27 @@ def main() -> int:
 
     lock_patterns = [_glob_to_regex(p) for p in args.lock_glob]
 
-    # Optional: enumerate Photos library originals via osxphotos.
+    # Source-specific id maps for write-back.
     uuid_by_path: dict[str, str] = {}
-    photos_files: list[tuple[Path, int]] = []
-    if args.photos_library:
-        photos_files, uuid_by_path = walk_photos_library(
-            library_path=args.photos_library_path,
-            skip_missing=True,
-        )
+    lr_id_by_path: dict[str, int] = {}
+    co_id_by_path: dict[str, str] = {}
+    catalog_files: list[tuple[Path, int]] = []
 
-    if args.photos_library and not roots:
-        by_tier = compute_clusters(
-            files=photos_files,
-            threshold=args.threshold,
-            min_size=args.min_size,
-            skip_tier3=args.skip_tier3,
-            time_gap=args.time_gap,
-        )
-    elif args.photos_library and roots:
-        # Combine Photos library originals + extra dir-scan files.
+    if args.photos_library:
+        pf, uuid_by_path = walk_photos_library(
+            library_path=args.photos_library_path, skip_missing=True)
+        catalog_files.extend(pf)
+    if args.lightroom_catalog:
+        lf, lr_id_by_path = walk_lightroom_catalog(args.lightroom_catalog)
+        catalog_files.extend(lf)
+    if args.capture_one_catalog:
+        cf, co_id_by_path = walk_capture_one_catalog(args.capture_one_catalog)
+        catalog_files.extend(cf)
+
+    if catalog_files and roots:
         dir_files: list[tuple[Path, int]] = []
-        for f in walk_images(roots, args.allow_photos_internals):
+        for f in walk_images(roots, args.allow_photos_internals,
+                             include_video=args.include_video):
             try:
                 sz = f.stat().st_size
             except OSError:
@@ -1202,13 +1622,20 @@ def main() -> int:
             if sz < args.min_size:
                 continue
             dir_files.append((f, sz))
-        combined = photos_files + dir_files
         by_tier = compute_clusters(
-            files=combined,
-            threshold=args.threshold,
-            min_size=args.min_size,
-            skip_tier3=args.skip_tier3,
-            time_gap=args.time_gap,
+            files=catalog_files + dir_files,
+            threshold=args.threshold, min_size=args.min_size,
+            skip_tier3=args.skip_tier3, time_gap=args.time_gap,
+            include_video=args.include_video,
+            video_match_ratio=args.video_match_ratio,
+        )
+    elif catalog_files:
+        by_tier = compute_clusters(
+            files=catalog_files,
+            threshold=args.threshold, min_size=args.min_size,
+            skip_tier3=args.skip_tier3, time_gap=args.time_gap,
+            include_video=args.include_video,
+            video_match_ratio=args.video_match_ratio,
         )
     else:
         by_tier = compute_clusters(
@@ -1218,6 +1645,8 @@ def main() -> int:
             min_size=args.min_size,
             skip_tier3=args.skip_tier3,
             time_gap=args.time_gap,
+            include_video=args.include_video,
+            video_match_ratio=args.video_match_ratio,
         )
 
     if not any(by_tier.values()):
@@ -1234,11 +1663,14 @@ def main() -> int:
         2: "Tier 2 (same pixels, metadata differs)",
         3: f"Tier 3 (perceptual <={args.threshold:>2d})              ",
         4: f"Tier 4 (series of shots <={args.time_gap}s)         ",
+        5: f"Tier 5 (video frame-match >={int(args.video_match_ratio*100)}%)  ",
     }
-    for t in (1, 2, 3, 4):
+    for t in (1, 2, 3, 4, 5):
         if t == 3 and args.skip_tier3:
             continue
         if t == 4 and args.time_gap == 0:
+            continue
+        if t == 5 and not args.include_video:
             continue
         groups = by_tier[t]
         print(f"{labels[t]} {len(groups):4d} clusters, "
@@ -1256,6 +1688,10 @@ def main() -> int:
             lock_patterns=lock_patterns,
             uuid_by_path=uuid_by_path,
             photos_delete_mode=args.photos_delete_mode,
+            lr_id_by_path=lr_id_by_path,
+            lr_catalog=args.lightroom_catalog,
+            lr_mode=args.lightroom_mode,
+            co_id_by_path=co_id_by_path,
         )
 
     # JSON report
@@ -1273,20 +1709,24 @@ def main() -> int:
             "tier4_series_of_shots": [
                 [{"path": str(f), "size": sz} for f, sz in g] for g in by_tier[4]
             ],
+            "tier5_video_match": [
+                [{"path": str(f), "size": sz} for f, sz in g] for g in by_tier[5]
+            ],
         }
         with open(args.json, "w") as fp:
             json.dump(payload, fp, indent=2)
         print(f"\nJSON report: {args.json}", file=sys.stderr)
     elif not args.quarantine:
         print()
-        for t in (1, 2, 3, 4):
+        for t in (1, 2, 3, 4, 5):
             groups = by_tier[t]
             if not groups:
                 continue
             label = {1: "TIER 1 - byte-identical",
                      2: "TIER 2 - same pixels, metadata differs",
                      3: "TIER 3 - perceptually similar",
-                     4: "TIER 4 - series of shots (EXIF time-window)"}[t]
+                     4: "TIER 4 - series of shots (EXIF time-window)",
+                     5: "TIER 5 - video frame-match"}[t]
             print(f"=== {label} ===")
             for g in groups:
                 keep_i = keep_index(g, args.keep)
@@ -1305,7 +1745,12 @@ def main() -> int:
         skipped_locked = 0
         photos_uuids: list[str] = []
         photos_export_pairs: list[tuple[str, str]] = []
-        for t in (1, 2, 3, 4):
+        lr_ids: list[int] = []
+        lr_pairs: list[tuple[str, int]] = []
+        co_ids: list[str] = []
+        co_pairs: list[tuple[str, str]] = []
+        rename_seq = 0
+        for t in (1, 2, 3, 4, 5):
             for group in by_tier[t]:
                 # Force locked files into the keep set; pick keep among them if any.
                 locked_idx = [i for i, (f, _) in enumerate(group) if is_locked(f, lock_patterns)]
@@ -1313,6 +1758,20 @@ def main() -> int:
                     keep_i = locked_idx[0]
                 else:
                     keep_i = keep_index(group, args.keep)
+                # Optional rename of the kept file.
+                if args.rename_pattern and not args.dry_run:
+                    keep_path, _ = group[keep_i]
+                    new_name = render_rename_template(
+                        keep_path, args.rename_pattern, seq=rename_seq)
+                    rename_seq += 1
+                    if new_name and new_name != keep_path.name:
+                        target_path = keep_path.parent / new_name
+                        if not target_path.exists():
+                            try:
+                                keep_path.rename(target_path)
+                            except OSError as e:
+                                print(f"  rename failed: {keep_path}: {e}",
+                                      file=sys.stderr)
                 for i, (f, sz) in enumerate(group):
                     if i == keep_i:
                         continue
@@ -1321,9 +1780,20 @@ def main() -> int:
                         continue
                     resolved = str(f.resolve())
                     if resolved in uuid_by_path:
-                        # Photos library asset: don't move, queue for delete handler.
                         photos_uuids.append(uuid_by_path[resolved])
                         photos_export_pairs.append((str(f), uuid_by_path[resolved]))
+                        moved += 1
+                        moved_bytes += sz
+                        continue
+                    if resolved in lr_id_by_path:
+                        lr_ids.append(lr_id_by_path[resolved])
+                        lr_pairs.append((str(f), lr_id_by_path[resolved]))
+                        moved += 1
+                        moved_bytes += sz
+                        continue
+                    if resolved in co_id_by_path:
+                        co_ids.append(co_id_by_path[resolved])
+                        co_pairs.append((str(f), co_id_by_path[resolved]))
                         moved += 1
                         moved_bytes += sz
                         continue
@@ -1349,8 +1819,15 @@ def main() -> int:
             print(f"Skipped {skipped_locked} locked file(s) "
                   f"(matched --lock-glob).", file=sys.stderr)
         if photos_uuids and not args.dry_run:
-            n_photos, msg = handle_photos_dupes(
+            _, msg = handle_photos_dupes(
                 photos_uuids, photos_export_pairs, q, args.photos_delete_mode)
+            print(msg, file=sys.stderr)
+        if lr_ids and not args.dry_run:
+            _, msg = handle_lightroom_dupes(
+                lr_ids, lr_pairs, args.lightroom_catalog, q, args.lightroom_mode)
+            print(msg, file=sys.stderr)
+        if co_ids and not args.dry_run:
+            _, msg = handle_capture_one_dupes(co_ids, co_pairs, q)
             print(msg, file=sys.stderr)
 
     return 0

@@ -4,3 +4,8 @@ __pycache__/
 venv/
 *.egg-info/
 .DS_Store
+swift/.build/
+swift/.swiftpm/
+swift/Package.resolved
+macapp/dist/
+.pytest_cache/

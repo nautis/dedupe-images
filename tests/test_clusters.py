@@ -6,7 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from dedupe_images import compute_clusters, _glob_to_regex, is_locked
+from dedupe_images import (compute_clusters, _glob_to_regex, is_locked,
+                            render_rename_template)
 
 
 def _all_paths(by_tier: dict) -> set[str]:
@@ -76,7 +77,7 @@ def test_threshold_is_monotonic(fixtures_dir: Path):
 
 def test_empty_dir_returns_empty(tmp_path: Path):
     by_tier = compute_clusters([tmp_path], log_progress=False)
-    assert by_tier == {1: [], 2: [], 3: [], 4: []}
+    assert by_tier == {1: [], 2: [], 3: [], 4: [], 5: []}
 
 
 def test_time_gap_groups_burst_frames(burst_dir: Path):
@@ -123,6 +124,32 @@ def test_is_locked():
     assert not is_locked(Path("/a/b/c.jpg"), [])
 
 
+def test_rename_template_basics(tmp_path: Path):
+    p = tmp_path / "subdir" / "photo.JPG"
+    p.parent.mkdir()
+    p.write_bytes(b"fake jpeg")
+    assert render_rename_template(p, "{stem}{ext}") == "photo.JPG"
+    assert render_rename_template(p, "{stem}-{seq}{ext}", seq=7) == "photo-0007.JPG"
+    assert render_rename_template(p, "{parent}_{stem}{ext}") == "subdir_photo.JPG"
+    out = render_rename_template(p, "{sha256_8}{ext}")
+    assert len(out) == 12  # 8 hex + ".JPG"
+    assert out.endswith(".JPG")
+
+
+def test_rename_template_exif_datetime(tmp_path: Path):
+    pytest.importorskip("piexif")
+    import piexif
+    from PIL import Image as PILImage
+    p = tmp_path / "img.jpg"
+    img = PILImage.new("RGB", (50, 50), (0, 0, 0))
+    exif_dict = {"Exif": {piexif.ExifIFD.DateTimeOriginal: b"2026:05:06 14:23:45"}}
+    img.save(p, "JPEG", exif=piexif.dump(exif_dict))
+    out = render_rename_template(p, "{exif:datetime}_{stem}{ext}")
+    assert out == "2026-05-06_142345_img.jpg"
+    out2 = render_rename_template(p, "{exif:datetime|%Y%m%d}{ext}")
+    assert out2 == "20260506.jpg"
+
+
 def test_pdf_files_cluster(tmp_path: Path):
     """Two PDFs with the same first-page content should cluster."""
     fitz = pytest.importorskip("fitz")
@@ -150,4 +177,4 @@ def test_min_size_filter(tmp_path: Path):
 
     # min_size larger than the file → no candidates → no clusters.
     by_tier = compute_clusters([tmp_path], min_size=10**9, log_progress=False)
-    assert by_tier == {1: [], 2: [], 3: [], 4: []}
+    assert by_tier == {1: [], 2: [], 3: [], 4: [], 5: []}
