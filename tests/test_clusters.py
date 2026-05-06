@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from dedupe_images import compute_clusters, _glob_to_regex, is_locked
 
 
@@ -119,6 +121,25 @@ def test_is_locked():
     assert is_locked(Path("/a/b/important.jpg"), [p1, p2])
     assert not is_locked(Path("/a/b/c.jpg"), [p1, p2])
     assert not is_locked(Path("/a/b/c.jpg"), [])
+
+
+def test_pdf_files_cluster(tmp_path: Path):
+    """Two PDFs with the same first-page content should cluster."""
+    fitz = pytest.importorskip("fitz")
+    out = tmp_path / "pdfs"
+    out.mkdir()
+    for name in ("a.pdf", "b.pdf"):
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=300)
+        page.insert_text((40, 40), "test pdf content", fontsize=24)
+        page.insert_text((40, 80), "more text here", fontsize=18)
+        doc.save(out / name)
+        doc.close()
+
+    by_tier = compute_clusters([out], min_size=128, log_progress=False)
+    paths = _all_paths(by_tier)
+    assert str(out / "a.pdf") in paths
+    assert str(out / "b.pdf") in paths
 
 
 def test_min_size_filter(tmp_path: Path):

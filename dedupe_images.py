@@ -6,6 +6,8 @@
 #     "imagehash>=4.3",
 #     "pillow-heif>=0.16",
 #     "Flask>=3.0",
+#     "rawpy>=0.21",
+#     "PyMuPDF>=1.24",
 # ]
 # ///
 """
@@ -61,10 +63,27 @@ try:
 except ImportError:
     pass
 
+try:
+    import rawpy
+    HAVE_RAWPY = True
+except ImportError:
+    HAVE_RAWPY = False
+
+try:
+    import fitz  # PyMuPDF
+    HAVE_FITZ = True
+except ImportError:
+    HAVE_FITZ = False
+
 IMAGE_EXTS = {
     ".jpg", ".jpeg", ".png", ".heic", ".heif",
     ".webp", ".tiff", ".tif", ".bmp", ".gif",
 }
+RAW_EXTS = {".cr2", ".cr3", ".nef", ".nrw", ".arw", ".srf", ".sr2",
+            ".dng", ".raf", ".rw2", ".orf", ".pef", ".rwl", ".x3f"}
+PDF_EXTS = {".pdf"}
+SCAN_EXTS = IMAGE_EXTS | RAW_EXTS | PDF_EXTS
+
 PHOTOS_DERIV_MARKER = ".photoslibrary/resources/derivatives"
 
 
@@ -80,26 +99,35 @@ def sha256_file(path: Path) -> str:
 
 def pixel_sha256(path: Path) -> str | None:
     try:
-        with Image.open(path) as img:
-            img.load()
+        img = open_canonical_image(path)
+        try:
+            if hasattr(img, "load"):
+                img.load()
             mode = "RGBA" if img.mode in ("RGBA", "LA", "PA") else "RGB"
-            canonical = img.convert(mode)
+            canonical = img.convert(mode) if img.mode != mode else img
             h = hashlib.sha256()
             h.update(f"{mode}:{canonical.size[0]}x{canonical.size[1]}:".encode())
             h.update(canonical.tobytes())
             return h.hexdigest()
+        finally:
+            if hasattr(img, "close"):
+                img.close()
     except Exception:
         return None
 
 
 def perceptual_hashes(path: Path) -> tuple[int, int] | tuple[None, None]:
     try:
-        with Image.open(path) as img:
+        img = open_canonical_image(path)
+        try:
             gray = img.convert("L")
             return (
                 int(str(imagehash.dhash(gray)), 16),
                 int(str(imagehash.phash(gray)), 16),
             )
+        finally:
+            if hasattr(img, "close"):
+                img.close()
     except Exception:
         return (None, None)
 
@@ -202,8 +230,51 @@ def walk_images(roots: list[Path], allow_photos: bool):
                 dirnames[:] = []
                 continue
             for name in filenames:
-                if Path(name).suffix.lower() in IMAGE_EXTS:
+                if Path(name).suffix.lower() in SCAN_EXTS:
                     yield Path(dirpath) / name
+
+
+def open_canonical_image(path: Path) -> "Image.Image":
+    """Open path and return a Pillow Image in RGB or RGBA mode.
+
+    Dispatches by extension:
+      - RAW (.cr2/.nef/.arw/...): try embedded JPEG preview via rawpy first
+        (fast); fall back to libraw render if no preview.
+      - PDF: render page 1 at 150 DPI via PyMuPDF.
+      - Everything else: Pillow direct.
+    """
+    ext = path.suffix.lower()
+
+    if ext in RAW_EXTS:
+        if not HAVE_RAWPY:
+            raise RuntimeError(
+                f"RAW file {path} requires rawpy (auto-installed via uv run)")
+        with rawpy.imread(str(path)) as raw:
+            try:
+                # Embedded JPEG preview is much faster than full demosaic.
+                thumb = raw.extract_thumb()
+                if thumb.format == rawpy.ThumbFormat.JPEG:
+                    return Image.open(io.BytesIO(thumb.data)).convert("RGB")
+            except (rawpy.LibRawNoThumbnailError, AttributeError):
+                pass
+            rgb = raw.postprocess(use_camera_wb=True, half_size=True)
+            return Image.fromarray(rgb, mode="RGB")
+
+    if ext in PDF_EXTS:
+        if not HAVE_FITZ:
+            raise RuntimeError(
+                f"PDF file {path} requires PyMuPDF (auto-installed via uv run)")
+        doc = fitz.open(str(path))
+        try:
+            page = doc.load_page(0)
+            mat = fitz.Matrix(150 / 72, 150 / 72)  # 150 DPI
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            mode = "RGB" if pix.n == 3 else "RGBA"
+            return Image.frombytes(mode, (pix.width, pix.height), pix.samples)
+        finally:
+            doc.close()
+
+    return Image.open(path)
 
 
 def fmt_bytes(n: float) -> str:
@@ -722,11 +793,30 @@ def run_review_server(
         p = resolve_allowed(qpath)
         if not p.exists():
             abort(404)
-        ext = p.suffix.lower().lstrip(".")
+        ext = p.suffix.lower()
+        # RAW and PDF: render canonical as JPEG so the browser can display it.
+        if ext in RAW_EXTS or ext in PDF_EXTS:
+            try:
+                img = open_canonical_image(p)
+                try:
+                    if img.mode not in ("RGB", "RGBA"):
+                        img = img.convert("RGB")
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=92)
+                    return Response(buf.getvalue(), mimetype="image/jpeg",
+                                    headers={"Cache-Control": "max-age=3600"})
+                finally:
+                    if hasattr(img, "close"):
+                        img.close()
+            except Exception as e:
+                print(f"  image render error on {p}: {e}", file=sys.stderr)
+                abort(500)
+        ext_key = ext.lstrip(".")
         mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
                 "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp",
                 "tif": "image/tiff", "tiff": "image/tiff",
-                "heic": "image/heic", "heif": "image/heif"}.get(ext, "application/octet-stream")
+                "heic": "image/heic", "heif": "image/heif"}.get(
+                    ext_key, "application/octet-stream")
         return Response(p.read_bytes(), mimetype=mime)
 
     @app.route("/api/thumb")
@@ -741,7 +831,8 @@ def run_review_server(
         if not p.exists():
             abort(404)
         try:
-            with Image.open(p) as img:
+            img = open_canonical_image(p)
+            try:
                 img.thumbnail((w, w * 4), Image.Resampling.LANCZOS)
                 if img.mode not in ("RGB", "RGBA"):
                     img = img.convert("RGB")
@@ -749,6 +840,9 @@ def run_review_server(
                 img.save(buf, format="JPEG", quality=82)
                 return Response(buf.getvalue(), mimetype="image/jpeg",
                                 headers={"Cache-Control": "max-age=3600"})
+            finally:
+                if hasattr(img, "close"):
+                    img.close()
         except Exception as e:
             print(f"  thumb error on {p}: {e}", file=sys.stderr)
             abort(500)

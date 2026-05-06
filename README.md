@@ -153,6 +153,8 @@ Wraps `uv run pytest tests/` with all needed deps inline. No venv setup required
 - Perceptual hashing is content-based. Two photos of the same scene from a slightly different angle may match at threshold 12+ even though they're genuinely different shots. Default threshold is 8, which is conservative.
 - Two files that are visually different but happen to hash to similar values (collision) is rare but possible. Always review tier-3 groups by eye before any destructive action - which is why this tool's destructive action is "move to quarantine" instead of "delete."
 - HEIC support requires `pillow-heif`, included by default. If pillow-heif fails to install on your machine, the script still runs against JPEG/PNG/WebP/etc.
+- RAW (`.cr2/.cr3/.nef/.nrw/.arw/.dng/.raf/.rw2/.orf/.pef/.rwl/.x3f`) is read via `rawpy`. Embedded JPEG previews are extracted when present (fast); otherwise a half-size libraw render is used. Files without previews on slow disks add a few seconds per file.
+- PDF support is via `PyMuPDF`: page 1 is rendered at 150 DPI as the canonical image. Multi-page PDFs only have their first page compared. Useful for catching duplicate scanned receipts and re-saved exports.
 
 ## License
 

@@ -9,4 +9,5 @@ exec uv run \
     --with Pillow \
     --with imagehash \
     --with pillow-heif \
+    --with PyMuPDF \
     pytest tests/ "$@"
