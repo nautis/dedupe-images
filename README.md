@@ -7,6 +7,7 @@ A small Python CLI that finds duplicate images across **three tiers**, in order 
 | 1 | Byte-identical files | SHA-256 of the file (what most "find duplicates" tools do) |
 | 2 | Same pixels, different metadata | SHA-256 of the **decoded pixel buffer**. Catches the case where two JPEGs render to the same image but have different EXIF, embedded thumbnails, color profile, orientation tag, etc. |
 | 3 | Perceptually similar | dHash + pHash with a Hamming-distance threshold. Catches re-encodes, slight quality changes, resaved versions, even minor crops. |
+| 4 | Series of shots (opt-in via `--time-gap`) | EXIF `DateTimeOriginal` time-window grouping. Catches burst-photography duplicates whose perceptual hash diverges (different angle, slight subject motion). |
 
 Most generic dedup tools only do tier 1. The reason two of your iPad screenshots from the Photos library showed up as "different" in Deduplicate File but looked identical: their JPEG bitstreams are the same but the EXIF blocks differ. Tier 2 catches that exactly.
 
@@ -78,6 +79,12 @@ dedupe_images.py [options] PATH [PATH ...]
   --json PATH                Write a JSON report instead of printing groups.
   --min-size BYTES           Skip files smaller than this. Default 1024.
   --skip-tier3               Skip perceptual hashing. Much faster on huge sets.
+  --time-gap SECONDS         Series of Shots: cluster files whose EXIF
+                             DateTimeOriginal is within SECONDS of another file.
+                             Off by default. Try 3 for burst photography.
+  --lock-glob PATTERN        Files matching this glob are 'locked' and never
+                             move. Repeatable. Supports ** for any-segments.
+                             Example: --lock-glob '**/keepers/*'
   --dry-run                  With --quarantine, show what would move.
 ```
 
@@ -126,6 +133,14 @@ Without `--json`, the script prints one block per tier with each group spelled o
 The `[KEEP]` marker reflects your `--keep` strategy. With `--quarantine`, the `[DUPE]` files are the ones that move.
 
 With `--json`, you get a structured report keyed by tier, with each group's files and their sizes. Suitable for piping into other tooling.
+
+## Tests
+
+```bash
+./run-tests.sh
+```
+
+Wraps `uv run pytest tests/` with all needed deps inline. No venv setup required.
 
 ## Performance notes
 

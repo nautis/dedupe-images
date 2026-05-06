@@ -104,8 +104,71 @@ def perceptual_hashes(path: Path) -> tuple[int, int] | tuple[None, None]:
         return (None, None)
 
 
+def exif_datetime_unix(path: Path) -> int | None:
+    """Return EXIF DateTimeOriginal as a unix timestamp, or None if absent.
+
+    Reads via Pillow's _getexif. No timezone handling - EXIF datetimes are
+    naive, treated as local time. Good enough for "are these two photos
+    within N seconds of each other."
+    """
+    try:
+        with Image.open(path) as img:
+            exif = img.getexif()
+            if not exif:
+                return None
+            # 36867 = DateTimeOriginal, 306 = DateTime, 36868 = DateTimeDigitized
+            for tag in (36867, 36868, 306):
+                v = exif.get(tag)
+                if v:
+                    break
+            else:
+                return None
+            # Format: "YYYY:MM:DD HH:MM:SS"
+            from datetime import datetime
+            try:
+                dt = datetime.strptime(str(v).strip(), "%Y:%m:%d %H:%M:%S")
+                return int(dt.timestamp())
+            except ValueError:
+                return None
+    except Exception:
+        return None
+
+
 def hamming(a: int, b: int) -> int:
     return (a ^ b).bit_count()
+
+
+def _glob_to_regex(pattern: str) -> "re.Pattern[str]":
+    """Convert a glob pattern with ** support to a compiled regex matching
+    full paths. * matches any chars except /, ? matches one char except /,
+    ** matches any number of path segments (including zero)."""
+    import re as _re
+    parts: list[str] = []
+    i = 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "*" and i + 1 < len(pattern) and pattern[i + 1] == "*":
+            parts.append(r".*")
+            i += 2
+            if i < len(pattern) and pattern[i] == "/":
+                i += 1
+        elif c == "*":
+            parts.append(r"[^/]*")
+            i += 1
+        elif c == "?":
+            parts.append(r"[^/]")
+            i += 1
+        else:
+            parts.append(_re.escape(c))
+            i += 1
+    return _re.compile("^" + "".join(parts) + "$")
+
+
+def is_locked(path: Path, lock_patterns: list["re.Pattern[str]"]) -> bool:
+    if not lock_patterns:
+        return False
+    s = str(path)
+    return any(p.match(s) is not None for p in lock_patterns)
 
 
 # ---------- union-find ----------
@@ -188,11 +251,16 @@ def compute_clusters(
     allow_photos: bool = False,
     min_size: int = 1024,
     skip_tier3: bool = False,
+    time_gap: int = 0,
     log_progress: bool = True,
 ) -> dict[int, list[list[tuple[Path, int]]]]:
     """Scan roots, run 3-tier dedup, return {tier: [cluster, ...]} where
     each cluster is a list of (path, size) tuples and tier is the weakest
-    joining tier."""
+    joining tier.
+
+    time_gap: if > 0, also unions files whose EXIF DateTimeOriginal is within
+    `time_gap` seconds of another file's. Cluster gets labeled tier 4.
+    """
 
     if log_progress:
         print(f"Scanning {len(roots)} root(s)...", file=sys.stderr)
@@ -274,12 +342,29 @@ def compute_clusters(
                     if hamming(d1, d2) <= threshold and hamming(p1, p2) <= threshold:
                         uf.union(idx_a, idx_b, tier=3)
 
+    # Tier 4: Series of Shots — union files within `time_gap` seconds.
+    if time_gap > 0:
+        timestamps: list[tuple[int, int]] = []  # (unix_ts, file_idx)
+        for i, (f, _) in enumerate(files):
+            ts = exif_datetime_unix(f)
+            if ts is not None:
+                timestamps.append((ts, i))
+            if log_progress and ((i + 1) % 50 == 0 or i == n - 1):
+                progress("Tier 4 (EXIF time)   ", i + 1, n)
+        # Sort by timestamp; sweep with a moving window.
+        timestamps.sort()
+        for k in range(1, len(timestamps)):
+            ts_a, idx_a = timestamps[k - 1]
+            ts_b, idx_b = timestamps[k]
+            if ts_b - ts_a <= time_gap:
+                uf.union(idx_a, idx_b, tier=4)
+
     # Build clusters
     clusters_by_root: dict[int, list[int]] = defaultdict(list)
     for i in range(n):
         clusters_by_root[uf.find(i)].append(i)
 
-    by_tier: dict[int, list[list[tuple[Path, int]]]] = {1: [], 2: [], 3: []}
+    by_tier: dict[int, list[list[tuple[Path, int]]]] = {1: [], 2: [], 3: [], 4: []}
     for root, idxs in clusters_by_root.items():
         if len(idxs) < 2:
             continue
@@ -342,8 +427,18 @@ REVIEW_HTML = r"""<!doctype html>
   .card .actions button { flex: 1; border: 0; padding: 10px;
                           background: #333; color: var(--fg); cursor: pointer;
                           font-size: 13px; }
-  .card .actions .keep-btn:hover, .card.keep .actions .keep-btn { background: var(--keep); }
-  .card .actions .dupe-btn:hover, .card.dupe .actions .dupe-btn { background: var(--dupe); }
+  .card .actions button:disabled { color: #555; cursor: not-allowed;
+                                   background: #2a2a2a; }
+  .card .actions .keep-btn:hover:not(:disabled),
+  .card.keep .actions .keep-btn { background: var(--keep); }
+  .card .actions .dupe-btn:hover:not(:disabled),
+  .card.dupe .actions .dupe-btn { background: var(--dupe); }
+  .card.locked { border-color: #b8860b; }
+  .card .lock-badge { position: absolute; top: 8px; right: 8px;
+                      background: rgba(184, 134, 11, 0.9); color: white;
+                      padding: 4px 8px; border-radius: 4px; font-size: 11px;
+                      font-weight: bold; pointer-events: none; }
+  .card { position: relative; }
   .empty { padding: 80px 24px; text-align: center; color: var(--muted); }
   .lightbox { position: fixed; inset: 0; background: rgba(0,0,0,0.95);
               display: none; align-items: center; justify-content: center;
@@ -414,8 +509,12 @@ function render() {
   grid.innerHTML = '';
   c.files.forEach((f, i) => {
     const card = document.createElement('div');
-    card.className = 'card ' + (decisions[f.path] || 'keep');
+    let cls = 'card ' + (decisions[f.path] || 'keep');
+    if (f.locked) cls += ' locked';
+    card.className = cls;
+    const lockBadge = f.locked ? '<div class="lock-badge">LOCKED</div>' : '';
     card.innerHTML = `
+      ${lockBadge}
       <img loading="lazy" src="/api/thumb?path=${encodeURIComponent(f.path)}&w=720"
            data-full="/api/image?path=${encodeURIComponent(f.path)}">
       <div class="info">
@@ -424,10 +523,12 @@ function render() {
       </div>
       <div class="actions">
         <button class="keep-btn">Keep</button>
-        <button class="dupe-btn">Dupe</button>
+        <button class="dupe-btn"${f.locked ? ' disabled title="locked by --lock-glob"' : ''}>Dupe</button>
       </div>`;
     card.querySelector('.keep-btn').onclick = () => mark(f.path, 'keep');
-    card.querySelector('.dupe-btn').onclick = () => mark(f.path, 'dupe');
+    if (!f.locked) {
+      card.querySelector('.dupe-btn').onclick = () => mark(f.path, 'dupe');
+    }
     card.querySelector('img').onclick = (e) => {
       const lb = document.getElementById('lightbox');
       document.getElementById('lightboxImg').src = e.target.dataset.full;
@@ -443,6 +544,7 @@ function tierLabel(t) {
     1: 'Tier 1 — byte-identical',
     2: 'Tier 2 — same pixels, metadata differs',
     3: 'Tier 3 — perceptually similar (eyeball this)',
+    4: 'Tier 4 — series of shots (eyeball this; subjects may differ)',
   }[t] || 'cluster';
 }
 
@@ -459,13 +561,17 @@ function mark(path, action) {
 }
 
 function markAll(action) {
-  clusters[cur].files.forEach(f => decisions[f.path] = action);
+  clusters[cur].files.forEach(f => {
+    if (f.locked) { decisions[f.path] = 'keep'; return; }
+    decisions[f.path] = action;
+  });
   render();
 }
 
 function pickOnly(idx) {
   const c = clusters[cur];
   c.files.forEach((f, i) => {
+    if (f.locked) { decisions[f.path] = 'keep'; return; }
     decisions[f.path] = (i === idx) ? 'keep' : 'dupe';
   });
   render();
@@ -529,21 +635,34 @@ def serialize_clusters_for_review(
     by_tier: dict[int, list[list[tuple[Path, int]]]],
     keep_strategy: str,
     quarantine: Path,
+    lock_patterns: list,
 ) -> tuple[list[dict], dict[str, str]]:
-    """Flatten by_tier into a list of cluster dicts and a default-decisions map."""
+    """Flatten by_tier into a list of cluster dicts and a default-decisions map.
+    Locked files (matching --lock-glob) are always defaulted to keep."""
     clusters = []
     defaults: dict[str, str] = {}
-    for tier in (1, 2, 3):
+    for tier in (1, 2, 3, 4):
         for group in by_tier[tier]:
-            keep_i = keep_index(group, keep_strategy)
-            files_payload = [{"path": str(f), "size": sz} for f, sz in group]
+            locked_idx = [i for i, (f, _) in enumerate(group)
+                          if is_locked(f, lock_patterns)]
+            if locked_idx:
+                keep_i = locked_idx[0]
+            else:
+                keep_i = keep_index(group, keep_strategy)
+            files_payload = [
+                {"path": str(f), "size": sz, "locked": is_locked(f, lock_patterns)}
+                for f, sz in group
+            ]
             clusters.append({
                 "tier": tier,
                 "files": files_payload,
                 "quarantine": str(quarantine),
             })
             for i, (f, _) in enumerate(group):
-                defaults[str(f)] = "keep" if i == keep_i else "dupe"
+                if is_locked(f, lock_patterns):
+                    defaults[str(f)] = "keep"
+                else:
+                    defaults[str(f)] = "keep" if i == keep_i else "dupe"
     return clusters, defaults
 
 
@@ -553,7 +672,9 @@ def run_review_server(
     keep_strategy: str,
     flat: bool,
     port: int,
+    lock_patterns: list | None = None,
 ) -> int:
+    lock_patterns = lock_patterns or []
     try:
         from flask import Flask, abort, jsonify, request, Response
     except ImportError:
@@ -562,12 +683,18 @@ def run_review_server(
 
     # Path whitelist: only paths from the actual scan can be served.
     allowed_paths: set[str] = set()
-    for tier in (1, 2, 3):
+    for tier in (1, 2, 3, 4):
         for group in by_tier[tier]:
             for f, _ in group:
                 allowed_paths.add(str(f.resolve()))
 
-    clusters, defaults = serialize_clusters_for_review(by_tier, keep_strategy, quarantine)
+    clusters, defaults = serialize_clusters_for_review(
+        by_tier, keep_strategy, quarantine, lock_patterns)
+    locked_set: set[str] = {
+        str(f.resolve()) for tier in by_tier.values()
+        for group in tier for f, _ in group
+        if is_locked(f, lock_patterns)
+    }
     shutdown_event = threading.Event()
 
     app = Flask(__name__)
@@ -631,10 +758,15 @@ def run_review_server(
         payload = request.get_json(silent=True) or {}
         decisions = payload.get("decisions", {})
         moves: list[tuple[Path, int]] = []
+        skipped_locked = 0
         for path_str, action in decisions.items():
             if action != "dupe":
                 continue
             if path_str not in allowed_paths:
+                continue
+            resolved_str = str(Path(path_str).resolve())
+            if resolved_str in locked_set:
+                skipped_locked += 1
                 continue
             p = Path(path_str)
             if not p.exists():
@@ -664,7 +796,7 @@ def run_review_server(
         print(f"\nQuarantined {moved} file(s), {fmt_bytes(moved_bytes)} -> {q}",
               file=sys.stderr)
         return jsonify({"moved": moved, "bytes": fmt_bytes(moved_bytes),
-                        "quarantine": str(q)})
+                        "quarantine": str(q), "skipped_locked": skipped_locked})
 
     @app.route("/api/shutdown", methods=["POST"])
     def api_shutdown():
@@ -729,6 +861,14 @@ def main() -> int:
                          "preserving their absolute path.")
     ap.add_argument("--skip-tier3", action="store_true",
                     help="Skip perceptual hashing. Much faster on huge sets.")
+    ap.add_argument("--time-gap", type=int, default=0, metavar="SECONDS",
+                    help="Series of Shots: also cluster files whose EXIF "
+                         "DateTimeOriginal is within SECONDS of another file. "
+                         "Default 0 (off). Try 3 for burst photography.")
+    ap.add_argument("--lock-glob", action="append", default=[], metavar="PATTERN",
+                    help="Files matching this glob pattern (relative to a scan root, "
+                         "supports **) are treated as 'locked' and cannot be moved. "
+                         "Repeatable. Example: --lock-glob '**/keepers/*'")
     ap.add_argument("--review", action="store_true",
                     help="Open a web UI to eyeball each cluster and pick what to keep. "
                          "Requires --quarantine. Default --keep choice pre-selects, you override.")
@@ -746,12 +886,15 @@ def main() -> int:
         print("--review requires --quarantine to know where dupes go.", file=sys.stderr)
         return 1
 
+    lock_patterns = [_glob_to_regex(p) for p in args.lock_glob]
+
     by_tier = compute_clusters(
         roots,
         threshold=args.threshold,
         allow_photos=args.allow_photos_internals,
         min_size=args.min_size,
         skip_tier3=args.skip_tier3,
+        time_gap=args.time_gap,
     )
 
     if not any(by_tier.values()):
@@ -767,9 +910,12 @@ def main() -> int:
         1: "Tier 1 (byte-identical)              ",
         2: "Tier 2 (same pixels, metadata differs)",
         3: f"Tier 3 (perceptual <={args.threshold:>2d})              ",
+        4: f"Tier 4 (series of shots <={args.time_gap}s)         ",
     }
-    for t in (1, 2, 3):
+    for t in (1, 2, 3, 4):
         if t == 3 and args.skip_tier3:
+            continue
+        if t == 4 and args.time_gap == 0:
             continue
         groups = by_tier[t]
         print(f"{labels[t]} {len(groups):4d} clusters, "
@@ -784,6 +930,7 @@ def main() -> int:
             keep_strategy=args.keep,
             flat=args.flat,
             port=args.port,
+            lock_patterns=lock_patterns,
         )
 
     # JSON report
@@ -798,19 +945,23 @@ def main() -> int:
             "tier3_perceptually_similar": [
                 [{"path": str(f), "size": sz} for f, sz in g] for g in by_tier[3]
             ],
+            "tier4_series_of_shots": [
+                [{"path": str(f), "size": sz} for f, sz in g] for g in by_tier[4]
+            ],
         }
         with open(args.json, "w") as fp:
             json.dump(payload, fp, indent=2)
         print(f"\nJSON report: {args.json}", file=sys.stderr)
     elif not args.quarantine:
         print()
-        for t in (1, 2, 3):
+        for t in (1, 2, 3, 4):
             groups = by_tier[t]
             if not groups:
                 continue
             label = {1: "TIER 1 - byte-identical",
                      2: "TIER 2 - same pixels, metadata differs",
-                     3: "TIER 3 - perceptually similar"}[t]
+                     3: "TIER 3 - perceptually similar",
+                     4: "TIER 4 - series of shots (EXIF time-window)"}[t]
             print(f"=== {label} ===")
             for g in groups:
                 keep_i = keep_index(g, args.keep)
@@ -826,11 +977,20 @@ def main() -> int:
             q.mkdir(parents=True, exist_ok=True)
         moved = 0
         moved_bytes = 0
-        for t in (1, 2, 3):
+        skipped_locked = 0
+        for t in (1, 2, 3, 4):
             for group in by_tier[t]:
-                keep_i = keep_index(group, args.keep)
+                # Force locked files into the keep set; pick keep among them if any.
+                locked_idx = [i for i, (f, _) in enumerate(group) if is_locked(f, lock_patterns)]
+                if locked_idx:
+                    keep_i = locked_idx[0]
+                else:
+                    keep_i = keep_index(group, args.keep)
                 for i, (f, sz) in enumerate(group):
                     if i == keep_i:
+                        continue
+                    if is_locked(f, lock_patterns):
+                        skipped_locked += 1
                         continue
                     target = q / f.name if args.flat else q / Path(*f.parts[1:])
                     if args.dry_run:
@@ -850,6 +1010,9 @@ def main() -> int:
                     moved_bytes += sz
         verb = "Would quarantine" if args.dry_run else "Quarantined"
         print(f"\n{verb} {moved} file(s), {fmt_bytes(moved_bytes)} -> {q}", file=sys.stderr)
+        if skipped_locked:
+            print(f"Skipped {skipped_locked} locked file(s) "
+                  f"(matched --lock-glob).", file=sys.stderr)
 
     return 0
 
