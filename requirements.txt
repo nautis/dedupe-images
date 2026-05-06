@@ -4,3 +4,5 @@ pillow-heif>=0.16
 Flask>=3.0
 rawpy>=0.21
 PyMuPDF>=1.24
+osxphotos>=0.75
+pyobjc-framework-Photos>=10.0; sys_platform == 'darwin'

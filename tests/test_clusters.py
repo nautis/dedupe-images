@@ -76,7 +76,7 @@ def test_threshold_is_monotonic(fixtures_dir: Path):
 
 def test_empty_dir_returns_empty(tmp_path: Path):
     by_tier = compute_clusters([tmp_path], log_progress=False)
-    assert by_tier == {1: [], 2: [], 3: []}
+    assert by_tier == {1: [], 2: [], 3: [], 4: []}
 
 
 def test_time_gap_groups_burst_frames(burst_dir: Path):
@@ -150,4 +150,4 @@ def test_min_size_filter(tmp_path: Path):
 
     # min_size larger than the file → no candidates → no clusters.
     by_tier = compute_clusters([tmp_path], min_size=10**9, log_progress=False)
-    assert by_tier == {1: [], 2: [], 3: []}
+    assert by_tier == {1: [], 2: [], 3: [], 4: []}

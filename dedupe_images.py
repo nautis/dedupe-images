@@ -8,6 +8,8 @@
 #     "Flask>=3.0",
 #     "rawpy>=0.21",
 #     "PyMuPDF>=1.24",
+#     "osxphotos>=0.75",
+#     "pyobjc-framework-Photos>=10.0; sys_platform == 'darwin'",
 # ]
 # ///
 """
@@ -74,6 +76,12 @@ try:
     HAVE_FITZ = True
 except ImportError:
     HAVE_FITZ = False
+
+try:
+    import osxphotos
+    HAVE_OSXPHOTOS = True
+except ImportError:
+    HAVE_OSXPHOTOS = False
 
 IMAGE_EXTS = {
     ".jpg", ".jpeg", ".png", ".heic", ".heif",
@@ -223,6 +231,131 @@ class UF:
 
 # ---------- helpers ----------
 
+def handle_photos_dupes(
+    uuids_to_delete: list[str],
+    paths_for_export: list[tuple[str, str]],  # [(path, uuid), ...]
+    quarantine: Path,
+    delete_mode: str,
+) -> tuple[int, str]:
+    """Handle Photos library dupes. Returns (count_handled, summary_message).
+
+    If delete_mode == 'export', writes a JSON file and tells the user how to
+    delete manually. If 'delete', tries PhotoKit via PyObjC.
+    """
+    if not uuids_to_delete:
+        return 0, ""
+
+    quarantine.mkdir(parents=True, exist_ok=True)
+    export_path = quarantine / "photos-to-delete.json"
+    payload = {
+        "uuids": uuids_to_delete,
+        "files": [{"path": p, "uuid": u} for p, u in paths_for_export],
+        "note": "These are Photos.app library originals identified as dupes. "
+                "Open Photos.app, search by UUID via the smart album feature "
+                "or use osxphotos to look up by uuid. Re-run dedupe-images with "
+                "--photos-delete-mode delete to send them to Recently Deleted.",
+    }
+    with open(export_path, "w") as fp:
+        json.dump(payload, fp, indent=2)
+
+    if delete_mode == "export":
+        return len(uuids_to_delete), (
+            f"Wrote {len(uuids_to_delete)} Photos UUID(s) to {export_path}. "
+            f"Use --photos-delete-mode delete to actually move them to "
+            f"Photos.app's Recently Deleted."
+        )
+
+    # delete_mode == 'delete': try PhotoKit via PyObjC.
+    try:
+        # PyObjC framework imports. Lazy-imported because the dep is heavy and
+        # only needed in this branch.
+        from Photos import (PHPhotoLibrary, PHAsset, PHAssetChangeRequest)  # type: ignore
+    except ImportError:
+        return 0, (
+            f"PhotoKit not available (pyobjc-framework-Photos not installed). "
+            f"UUIDs written to {export_path}. Install pyobjc-framework-Photos "
+            f"and re-run with --photos-delete-mode delete to actually delete."
+        )
+
+    print(f"  Sending {len(uuids_to_delete)} asset(s) to Photos.app's "
+          f"Recently Deleted (recoverable 30 days)...", file=sys.stderr)
+    print(f"  (First run: macOS will prompt for Photos.app access)",
+          file=sys.stderr)
+
+    fetch = PHAsset.fetchAssetsWithLocalIdentifiers_options_(
+        uuids_to_delete, None)
+    if fetch.count() == 0:
+        return 0, (f"PhotoKit returned 0 assets for {len(uuids_to_delete)} "
+                   f"UUIDs. Maybe the assets were already deleted, or UUID "
+                   f"format mismatch (osxphotos vs PhotoKit may differ). "
+                   f"UUIDs preserved at {export_path}.")
+
+    library = PHPhotoLibrary.sharedPhotoLibrary()
+    error_box: list = [None]
+
+    def change_block():
+        PHAssetChangeRequest.deleteAssets_(fetch)
+
+    success, error = library.performChangesAndWait_error_(change_block, None)
+    if not success:
+        return 0, (f"PhotoKit performChangesAndWait failed: {error}. "
+                   f"UUIDs preserved at {export_path}.")
+
+    return fetch.count(), (
+        f"Sent {fetch.count()} asset(s) to Photos.app's Recently Deleted. "
+        f"They'll auto-purge in 30 days, recoverable until then. "
+        f"UUID record preserved at {export_path}."
+    )
+
+
+def walk_photos_library(library_path: Path | None = None,
+                        skip_missing: bool = True,
+                        log_progress: bool = True
+                        ) -> tuple[list[tuple[Path, int]], dict[str, str]]:
+    """Enumerate originals from the macOS Photos library via osxphotos.
+
+    Returns (file_list, uuid_by_path) where file_list is [(path, size), ...]
+    and uuid_by_path maps absolute path → asset UUID for write-back.
+
+    skip_missing: if True, skip iCloud-only photos that aren't downloaded.
+    """
+    if not HAVE_OSXPHOTOS:
+        raise RuntimeError(
+            "osxphotos required for --photos-library "
+            "(auto-installed via uv run)")
+    if log_progress:
+        print(f"Opening Photos library{f' at {library_path}' if library_path else ''}...",
+              file=sys.stderr)
+    db = osxphotos.PhotosDB(dbfile=str(library_path)) if library_path else osxphotos.PhotosDB()
+    files: list[tuple[Path, int]] = []
+    uuid_by_path: dict[str, str] = {}
+    skipped = 0
+    photos = db.photos()
+    if log_progress:
+        print(f"Photos library has {len(photos)} assets, enumerating originals...",
+              file=sys.stderr)
+    for photo in photos:
+        path = photo.path
+        if not path:
+            skipped += 1
+            if skip_missing:
+                continue
+        if not path or not Path(path).exists():
+            skipped += 1
+            continue
+        p = Path(path)
+        try:
+            sz = p.stat().st_size
+        except OSError:
+            continue
+        files.append((p, sz))
+        uuid_by_path[str(p.resolve())] = photo.uuid
+    if log_progress:
+        print(f"  {len(files)} originals readable, {skipped} skipped (iCloud-only/missing)",
+              file=sys.stderr)
+    return files, uuid_by_path
+
+
 def walk_images(roots: list[Path], allow_photos: bool):
     for root in roots:
         for dirpath, dirnames, filenames in os.walk(root):
@@ -316,8 +449,9 @@ def keep_index(group: list[tuple[Path, int]], strategy: str) -> int:
 # ---------- core: compute clusters ----------
 
 def compute_clusters(
-    roots: list[Path],
+    roots: list[Path] | None = None,
     *,
+    files: list[tuple[Path, int]] | None = None,
     threshold: int = 8,
     allow_photos: bool = False,
     min_size: int = 1024,
@@ -329,25 +463,31 @@ def compute_clusters(
     each cluster is a list of (path, size) tuples and tier is the weakest
     joining tier.
 
+    Either pass `roots` (directories to walk) or `files` (a pre-built list
+    of (path, size) tuples, e.g. from osxphotos).
+
     time_gap: if > 0, also unions files whose EXIF DateTimeOriginal is within
     `time_gap` seconds of another file's. Cluster gets labeled tier 4.
     """
 
-    if log_progress:
-        print(f"Scanning {len(roots)} root(s)...", file=sys.stderr)
-    files: list[tuple[Path, int]] = []
-    for f in walk_images(roots, allow_photos):
-        try:
-            sz = f.stat().st_size
-        except OSError:
-            continue
-        if sz < min_size:
-            continue
-        files.append((f, sz))
-    if log_progress:
-        print(f"Found {len(files)} candidate images", file=sys.stderr)
+    if files is None:
+        if not roots:
+            raise ValueError("Must pass either roots or files")
+        if log_progress:
+            print(f"Scanning {len(roots)} root(s)...", file=sys.stderr)
+        files = []
+        for f in walk_images(roots, allow_photos):
+            try:
+                sz = f.stat().st_size
+            except OSError:
+                continue
+            if sz < min_size:
+                continue
+            files.append((f, sz))
+        if log_progress:
+            print(f"Found {len(files)} candidate images", file=sys.stderr)
     if not files:
-        return {1: [], 2: [], 3: []}
+        return {1: [], 2: [], 3: [], 4: []}
 
     n = len(files)
     uf = UF(n)
@@ -584,8 +724,9 @@ function render() {
     if (f.locked) cls += ' locked';
     card.className = cls;
     const lockBadge = f.locked ? '<div class="lock-badge">LOCKED</div>' : '';
+    const photosBadge = f.uuid ? '<div class="lock-badge" style="background:#0a84ff">PHOTOS</div>' : '';
     card.innerHTML = `
-      ${lockBadge}
+      ${lockBadge}${photosBadge}
       <img loading="lazy" src="/api/thumb?path=${encodeURIComponent(f.path)}&w=720"
            data-full="/api/image?path=${encodeURIComponent(f.path)}">
       <div class="info">
@@ -707,9 +848,12 @@ def serialize_clusters_for_review(
     keep_strategy: str,
     quarantine: Path,
     lock_patterns: list,
+    uuid_by_path: dict[str, str] | None = None,
 ) -> tuple[list[dict], dict[str, str]]:
     """Flatten by_tier into a list of cluster dicts and a default-decisions map.
-    Locked files (matching --lock-glob) are always defaulted to keep."""
+    Locked files (matching --lock-glob) are always defaulted to keep.
+    Photos library files get a 'uuid' field for UI display."""
+    uuid_by_path = uuid_by_path or {}
     clusters = []
     defaults: dict[str, str] = {}
     for tier in (1, 2, 3, 4):
@@ -720,10 +864,17 @@ def serialize_clusters_for_review(
                 keep_i = locked_idx[0]
             else:
                 keep_i = keep_index(group, keep_strategy)
-            files_payload = [
-                {"path": str(f), "size": sz, "locked": is_locked(f, lock_patterns)}
-                for f, sz in group
-            ]
+            files_payload = []
+            for f, sz in group:
+                resolved = str(f.resolve())
+                entry = {
+                    "path": str(f),
+                    "size": sz,
+                    "locked": is_locked(f, lock_patterns),
+                }
+                if resolved in uuid_by_path:
+                    entry["uuid"] = uuid_by_path[resolved]
+                files_payload.append(entry)
             clusters.append({
                 "tier": tier,
                 "files": files_payload,
@@ -744,8 +895,11 @@ def run_review_server(
     flat: bool,
     port: int,
     lock_patterns: list | None = None,
+    uuid_by_path: dict[str, str] | None = None,
+    photos_delete_mode: str = "export",
 ) -> int:
     lock_patterns = lock_patterns or []
+    uuid_by_path = uuid_by_path or {}
     try:
         from flask import Flask, abort, jsonify, request, Response
     except ImportError:
@@ -760,7 +914,7 @@ def run_review_server(
                 allowed_paths.add(str(f.resolve()))
 
     clusters, defaults = serialize_clusters_for_review(
-        by_tier, keep_strategy, quarantine, lock_patterns)
+        by_tier, keep_strategy, quarantine, lock_patterns, uuid_by_path)
     locked_set: set[str] = {
         str(f.resolve()) for tier in by_tier.values()
         for group in tier for f, _ in group
@@ -852,6 +1006,8 @@ def run_review_server(
         payload = request.get_json(silent=True) or {}
         decisions = payload.get("decisions", {})
         moves: list[tuple[Path, int]] = []
+        photos_uuids: list[str] = []
+        photos_pairs: list[tuple[str, str]] = []
         skipped_locked = 0
         for path_str, action in decisions.items():
             if action != "dupe":
@@ -861,6 +1017,10 @@ def run_review_server(
             resolved_str = str(Path(path_str).resolve())
             if resolved_str in locked_set:
                 skipped_locked += 1
+                continue
+            if resolved_str in uuid_by_path:
+                photos_uuids.append(uuid_by_path[resolved_str])
+                photos_pairs.append((path_str, uuid_by_path[resolved_str]))
                 continue
             p = Path(path_str)
             if not p.exists():
@@ -887,10 +1047,24 @@ def run_review_server(
                 moved_bytes += sz
             except OSError as e:
                 print(f"  move failed: {f}: {e}", file=sys.stderr)
+
+        photos_msg = ""
+        photos_count = 0
+        if photos_uuids:
+            photos_count, photos_msg = handle_photos_dupes(
+                photos_uuids, photos_pairs, q, photos_delete_mode)
+            print(photos_msg, file=sys.stderr)
+
         print(f"\nQuarantined {moved} file(s), {fmt_bytes(moved_bytes)} -> {q}",
               file=sys.stderr)
-        return jsonify({"moved": moved, "bytes": fmt_bytes(moved_bytes),
-                        "quarantine": str(q), "skipped_locked": skipped_locked})
+        return jsonify({
+            "moved": moved + photos_count,
+            "bytes": fmt_bytes(moved_bytes),
+            "quarantine": str(q),
+            "skipped_locked": skipped_locked,
+            "photos_handled": photos_count,
+            "photos_msg": photos_msg,
+        })
 
     @app.route("/api/shutdown", methods=["POST"])
     def api_shutdown():
@@ -934,7 +1108,21 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    ap.add_argument("paths", nargs="+", help="Directories to scan")
+    ap.add_argument("paths", nargs="*", default=[],
+                    help="Directories to scan. Omit and pass --photos-library "
+                         "to scan the Photos.app library instead.")
+    ap.add_argument("--photos-library", action="store_true",
+                    help="Scan the macOS Photos.app library originals via osxphotos "
+                         "instead of (or in addition to) directories. On commit, "
+                         "writes asset UUIDs to <quarantine>/photos-to-delete.json.")
+    ap.add_argument("--photos-library-path", type=Path, default=None,
+                    help="Explicit path to a .photoslibrary (default: system library).")
+    ap.add_argument("--photos-delete-mode", choices=["export", "delete"],
+                    default="export",
+                    help="With --photos-library: 'export' (default, safe) writes asset "
+                         "UUIDs to <quarantine>/photos-to-delete.json for manual review. "
+                         "'delete' calls PhotoKit to send dupes to Photos.app's "
+                         "'Recently Deleted' (30-day recoverable).")
     ap.add_argument("--threshold", type=int, default=8,
                     help="Max Hamming distance for perceptual match (default: 8). "
                          "0 = pixel-equivalent after rescale; 4-8 = visibly the same; >12 = loose.")
@@ -976,20 +1164,61 @@ def main() -> int:
             print(f"Path not found: {r}", file=sys.stderr)
             return 1
 
+    if not roots and not args.photos_library:
+        print("No paths given. Pass directories or --photos-library.", file=sys.stderr)
+        return 1
+
     if args.review and args.quarantine is None:
         print("--review requires --quarantine to know where dupes go.", file=sys.stderr)
         return 1
 
     lock_patterns = [_glob_to_regex(p) for p in args.lock_glob]
 
-    by_tier = compute_clusters(
-        roots,
-        threshold=args.threshold,
-        allow_photos=args.allow_photos_internals,
-        min_size=args.min_size,
-        skip_tier3=args.skip_tier3,
-        time_gap=args.time_gap,
-    )
+    # Optional: enumerate Photos library originals via osxphotos.
+    uuid_by_path: dict[str, str] = {}
+    photos_files: list[tuple[Path, int]] = []
+    if args.photos_library:
+        photos_files, uuid_by_path = walk_photos_library(
+            library_path=args.photos_library_path,
+            skip_missing=True,
+        )
+
+    if args.photos_library and not roots:
+        by_tier = compute_clusters(
+            files=photos_files,
+            threshold=args.threshold,
+            min_size=args.min_size,
+            skip_tier3=args.skip_tier3,
+            time_gap=args.time_gap,
+        )
+    elif args.photos_library and roots:
+        # Combine Photos library originals + extra dir-scan files.
+        dir_files: list[tuple[Path, int]] = []
+        for f in walk_images(roots, args.allow_photos_internals):
+            try:
+                sz = f.stat().st_size
+            except OSError:
+                continue
+            if sz < args.min_size:
+                continue
+            dir_files.append((f, sz))
+        combined = photos_files + dir_files
+        by_tier = compute_clusters(
+            files=combined,
+            threshold=args.threshold,
+            min_size=args.min_size,
+            skip_tier3=args.skip_tier3,
+            time_gap=args.time_gap,
+        )
+    else:
+        by_tier = compute_clusters(
+            roots,
+            threshold=args.threshold,
+            allow_photos=args.allow_photos_internals,
+            min_size=args.min_size,
+            skip_tier3=args.skip_tier3,
+            time_gap=args.time_gap,
+        )
 
     if not any(by_tier.values()):
         print("\nNo duplicate clusters found.", file=sys.stderr)
@@ -1025,6 +1254,8 @@ def main() -> int:
             flat=args.flat,
             port=args.port,
             lock_patterns=lock_patterns,
+            uuid_by_path=uuid_by_path,
+            photos_delete_mode=args.photos_delete_mode,
         )
 
     # JSON report
@@ -1072,6 +1303,8 @@ def main() -> int:
         moved = 0
         moved_bytes = 0
         skipped_locked = 0
+        photos_uuids: list[str] = []
+        photos_export_pairs: list[tuple[str, str]] = []
         for t in (1, 2, 3, 4):
             for group in by_tier[t]:
                 # Force locked files into the keep set; pick keep among them if any.
@@ -1085,6 +1318,14 @@ def main() -> int:
                         continue
                     if is_locked(f, lock_patterns):
                         skipped_locked += 1
+                        continue
+                    resolved = str(f.resolve())
+                    if resolved in uuid_by_path:
+                        # Photos library asset: don't move, queue for delete handler.
+                        photos_uuids.append(uuid_by_path[resolved])
+                        photos_export_pairs.append((str(f), uuid_by_path[resolved]))
+                        moved += 1
+                        moved_bytes += sz
                         continue
                     target = q / f.name if args.flat else q / Path(*f.parts[1:])
                     if args.dry_run:
@@ -1107,6 +1348,10 @@ def main() -> int:
         if skipped_locked:
             print(f"Skipped {skipped_locked} locked file(s) "
                   f"(matched --lock-glob).", file=sys.stderr)
+        if photos_uuids and not args.dry_run:
+            n_photos, msg = handle_photos_dupes(
+                photos_uuids, photos_export_pairs, q, args.photos_delete_mode)
+            print(msg, file=sys.stderr)
 
     return 0
 

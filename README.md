@@ -85,6 +85,13 @@ dedupe_images.py [options] PATH [PATH ...]
   --lock-glob PATTERN        Files matching this glob are 'locked' and never
                              move. Repeatable. Supports ** for any-segments.
                              Example: --lock-glob '**/keepers/*'
+  --photos-library           Scan the macOS Photos.app library originals via
+                             osxphotos. Can be combined with directory paths.
+  --photos-library-path P    Explicit path to a .photoslibrary.
+  --photos-delete-mode MODE  'export' (default, safe) writes UUIDs to
+                             <quarantine>/photos-to-delete.json. 'delete'
+                             calls PhotoKit to send dupes to Photos.app's
+                             Recently Deleted (30-day recoverable).
   --dry-run                  With --quarantine, show what would move.
 ```
 
@@ -133,6 +140,33 @@ Without `--json`, the script prints one block per tier with each group spelled o
 The `[KEEP]` marker reflects your `--keep` strategy. With `--quarantine`, the `[DUPE]` files are the ones that move.
 
 With `--json`, you get a structured report keyed by tier, with each group's files and their sizes. Suitable for piping into other tooling.
+
+## Apple Photos library mode
+
+Scan your Photos.app library originals (not derivatives — Photos manages those):
+
+```bash
+# Safe: identifies dupes, exports UUIDs to a JSON file you review by hand
+uv run ~/dedupe-images/dedupe_images.py --photos-library --quarantine ~/photos-quar
+
+# After reviewing, actually send dupes to Photos.app's "Recently Deleted"
+# (recoverable for 30 days):
+uv run ~/dedupe-images/dedupe_images.py --photos-library \
+  --photos-delete-mode delete --quarantine ~/photos-quar
+```
+
+Combine with `--review` to eyeball each cluster before any commit:
+
+```bash
+uv run ~/dedupe-images/dedupe_images.py --review --photos-library \
+  --quarantine ~/photos-quar
+```
+
+**Permissions you'll need:**
+- Terminal needs **Full Disk Access** to read the Photos library SQLite catalog (System Settings → Privacy & Security → Full Disk Access).
+- First time you run with `--photos-delete-mode delete`, macOS will prompt for **Photos library access**. Approve once.
+
+**iCloud-only photos** (not downloaded to disk) are skipped silently. To force-download for dedup, run `osxphotos export --download-missing` first or open them in Photos.app to trigger a download.
 
 ## Tests
 
